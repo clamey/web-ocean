@@ -14,7 +14,8 @@
            background: #0b0f14c8; backdrop-filter: blur(6px); color: #e5e1d8; font: 12px/1.3 system-ui, sans-serif; }
   #panel.hidden { display: none; }
   #panel label { display: grid; grid-template-columns: 1fr 110px 40px; gap: 6px; align-items: center; margin: 3px 0; }
-  #panel input { width: 110px; accent-color: #e2a04e; }
+  #panel input, #panel select { width: 110px; accent-color: #e2a04e; }
+  #panel select, #panel input[type=date] { font: inherit; color-scheme: dark; }
   #panel output { text-align: right; font-variant-numeric: tabular-nums; opacity: .8; }
   #err { position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
 </style>
@@ -23,6 +24,7 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
+  <div id="where"></div>
   <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel</div>
 </div>
 <div id="panel" class="hidden"></div>
@@ -51,7 +53,7 @@ struct Frame {
   screen:   vec4f,     // w, h, 1/w, 1/h
   cascL:    array<vec4f, 2>,  // cascade patch sizes (m), index [c>>2][c&3]
   cascInvL: array<vec4f, 2>,
-  windP:    array<vec4f, 2>,  // [0].xy = wind direction (unit), [0].z = wind speed
+  windP:    array<vec4f, 2>,  // [0].xy = wind direction (unit), [0].z = wind speed, [1].x = bird count
   lodP:     vec4f,     // CDLOD base range, grid quads per node, -, -
   post:     vec4f,     // exposure, bloom strength, frame index, -
   atmo:     vec4f,     // haze (mie multiplier), camera altitude km, -, -
@@ -60,6 +62,9 @@ struct Frame {
   foamP:    vec4f,     // J threshold, J gain, foam intensity, lace sharpness
   fogExt:   vec4f,     // rgb extinction per metre near sea level
   cloudP:   vec4f,     // altitude km, coverage, optical density, wind time
+  astro:    vec4f,     // local sidereal time, latitude, scene azimuth of true north (rad), pre-exposure
+  moonDir:  vec4f,     // xyz towards the moon, w = moonlight illuminance above the atmosphere
+  moonUp:   vec4f,     // xyz towards the north ecliptic pole (~ lunar north), w = angular radius
 };
 `;
 
@@ -143,6 +148,12 @@ fn phaseHG(c: f32, g: f32) -> f32 {
 // true when the sun is below the geometric horizon of a point at radius r
 fn sunBelowHorizon(r: f32, mu: f32) -> bool {
   return mu < -rhoOf(r) / r;
+}
+// visible fraction of the solar disc from a point at radius r (the Earth's shadow); exactly
+// 1 while the whole disc is above that point's horizon
+fn earthShadow(r: f32, mu: f32) -> f32 {
+  let muH = -rhoOf(r) / r;
+  return smoothstep(muH - SUN_ANG_R, muH + SUN_ANG_R, mu);
 }
 `;
 
@@ -619,6 +630,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // ---- js/wgsl/sky.js ----
 // Physically based atmosphere (Hillaire 2020 style LUTs) + procedural cloud deck.
 
+// Sky luminance (renderer units) below which the eye adaptation starts: the measured
+// average at sun elevation 0 deg, so sunset and daytime scenes keep their exposure.
+const ADAPT_REF = '0.046';
+
 const ATMO_UNIFORM = /* wgsl */ `
 struct AtmoP { haze: vec4f };   // x = mie multiplier
 @group(0) @binding(0) var<uniform> A: AtmoP;
@@ -723,6 +738,8 @@ const SKYVIEW_LUT = FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
 @group(0) @binding(4) var dst: texture_storage_2d<rgba16float, write>;
 const SKY_W: f32 = ${SKY_W}.0;
 const SKY_H: f32 = ${SKY_H}.0;
+// 1 = compute the moonlit sky (layer 1) instead of the sunlit one (layer 0)
+override MOON: f32 = 0.0;
 
 fn sampleTrans(r: f32, mu: f32) -> vec3f {
   return textureSampleLevel(transLUT, sampC, transRMuToUV(r, mu), 0.0).rgb;
@@ -757,7 +774,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let lvc = -(cx * 2.0 - 1.0);
   let lvs = sqrt(max(0.0, 1.0 - lvc * lvc));
   let rd = vec3f(vzs * lvc, vzc, vzs * lvs);
-  let smu = F.sunDir.y;
+  // the light: the sun, or the moon for the moonlit-sky layer
+  let smu = select(F.sunDir.y, F.moonDir.y, MOON > 0.5);
   let sun = vec3f(sqrt(max(0.0, 1.0 - smu * smu)), smu, 0.0);
   let ro = vec3f(0.0, r, 0.0);
 
@@ -793,7 +811,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     L += T * (S - S * Ts) / ext;
     T *= Ts;
   }
-  textureStore(dst, id.xy, vec4f(L, 1.0));
+  // pre-exposed, so deep twilight stays well inside half-float range
+  // pre-exposed, so deep twilight stays well inside half-float range; the moon layer also
+  // carries the moonlight illuminance (per unit it would overflow under the night gain)
+  textureStore(dst, id.xy, vec4f(L * select(F.astro.w, F.astro.w * F.moonDir.w, MOON > 0.5), 1.0));
 }
 `;
 
@@ -810,10 +831,15 @@ fn sampleTrans(r: f32, mu: f32) -> vec3f {
 }
 
 fn sunIlluminance() -> vec3f {
-  return sampleTrans(camR(), F.sunDir.y) * F.sunDir.w;
+  return sampleTrans(camR(), F.sunDir.y) * (F.sunDir.w * F.astro.w * earthShadow(camR(), F.sunDir.y));
 }
 
-fn skyViewUV(dir: vec3f) -> vec2f {
+// moonlight reaching the camera (pre-exposed), zero once the moon has set
+fn moonIlluminance() -> vec3f {
+  return sampleTrans(camR(), F.moonDir.y) * (F.moonDir.w * F.astro.w * earthShadow(camR(), F.moonDir.y));
+}
+
+fn skyViewUV(dir: vec3f, light: vec3f) -> vec2f {
   let r = camR();
   let vHorizon = rhoOf(r);
   let cosBeta = vHorizon / r;
@@ -833,15 +859,24 @@ fn skyViewUV(dir: vec3f) -> vec2f {
     uv.y = coord * 0.5 + 0.5;
   }
   let dl = length(dir.xz);
-  let sl = length(F.sunDir.xz);
+  let sl = length(light.xz);
   var lvc = 1.0;
-  if (dl > 1e-6 && sl > 1e-6) { lvc = clamp(dot(dir.xz, F.sunDir.xz) / (dl * sl), -1.0, 1.0); }
+  if (dl > 1e-6 && sl > 1e-6) { lvc = clamp(dot(dir.xz, light.xz) / (dl * sl), -1.0, 1.0); }
   uv.x = sqrt(max(-lvc * 0.5 + 0.5, 0.0));
   return vec2f(fromUnitToSubUvs(uv.x, SKY_W), fromUnitToSubUvs(uv.y, SKY_H));
 }
 
 fn skyAtmo(dir: vec3f) -> vec3f {
-  return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+  return textureSampleLevel(skyLUT, sampC, skyViewUV(dir, F.sunDir.xyz), 0, 0.0).rgb * F.sunDir.w
+       + textureSampleLevel(skyLUT, sampC, skyViewUV(dir, F.moonDir.xyz), 1, 0.0).rgb + nightSky(dir);
+}
+
+// Moonless night sky: airglow, zodiacal light and unresolved starlight, about 21.5 mag per
+// square arcsecond (2e-4 cd/m2) at the zenith and brighter towards the horizon. Far below
+// anything visible by day.
+const NIGHT_SKY: vec3f = vec3f(1.7e-8, 2.2e-8, 2.9e-8);
+fn nightSky(dir: vec3f) -> vec3f {
+  return NIGHT_SKY * (1.0 + 2.0 * (1.0 - smoothstep(0.0, 0.35, dir.y))) * F.astro.w;
 }
 `;
 
@@ -919,7 +954,9 @@ fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f3
   let alpha = 1.0 - exp(-tau);
   let tauS = (d * 0.5 + s1 * 0.6 + s2 + s3 * 0.7) * sigma * 0.55;
   let Ts = exp(-tauS);
-  let sunC = sampleTrans(RG + hc, dot(h.up, F.sunDir.xyz)) * F.sunDir.w;
+  let smu = dot(h.up, F.sunDir.xyz);
+  // clouds keep the sun a little after sunset at sea level, until the Earth's shadow reaches them
+  let sunC = sampleTrans(RG + hc, smu) * (F.sunDir.w * F.astro.w * earthShadow(RG + hc, smu));
   let cosT = dot(dir, F.sunDir.xyz);
   let ph = mix(phaseHG(cosT, g), phaseHG(cosT, -0.2), 0.25);
   let fwd = smoothstep(-0.2, 0.7, cosT);
@@ -931,10 +968,18 @@ fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f3
   // see from below, so diffused sunlight shows mostly when looking towards the sun
   let toward = smoothstep(-0.3, 0.9, cosT);
   let ms = sunC * (0.025 + 0.22 * rim) * mix(1.0, Ts, 0.5) * alpha * (0.25 + 0.75 * toward);
-  // bases are lit by the sky from the sides/below (horizon band + sea), cooler than the tops
-  let amb = (skyAtmo(normalize(vec3f(dir.x, 0.03, dir.z))) * 0.26 + skyAtmo(vec3f(0.0, 1.0, 0.0)) * 0.42)
-            * alpha * (1.0 - 0.35 * d);
-  return vec4f(single + ms + amb, alpha);
+  // bases are lit by the sky from the sides/below (horizon band + sea), cooler than the tops.
+  // Once the cloud is in the Earth's shadow the twilight glow is concentrated towards the
+  // sun, so take the horizon at right angles to it instead (the band's azimuthal average)
+  let hz = mix(skyAtmo(normalize(vec3f(dir.x, 0.03, dir.z))),
+               skyAtmo(normalize(vec3f(-F.sunDir.z, 0.03, F.sunDir.x))), 1.0 - earthShadow(RG + hc, smu));
+  let amb = (hz * 0.26 + skyAtmo(vec3f(0.0, 1.0, 0.0)) * 0.42) * alpha * (1.0 - 0.35 * d);
+  // moonlight: forward-scattered through thin parts, a dull grey glow elsewhere
+  let mmu = dot(h.up, F.moonDir.xyz);
+  let moonC = sampleTrans(RG + hc, mmu) * (F.moonDir.w * F.astro.w * earthShadow(RG + hc, mmu));
+  let cosM = dot(dir, F.moonDir.xyz);
+  let moonLit = moonC * alpha * (0.05 + 1.5 * mix(phaseHG(cosM, g), phaseHG(cosM, -0.2), 0.25)) * (1.0 - 0.4 * d);
+  return vec4f(single + ms + amb + moonLit, alpha);
 }
 
 // returns (premultiplied radiance, fraction of the background sky hidden)
@@ -1005,8 +1050,93 @@ fn sunDisk(dir: vec3f) -> vec3f {
   let x = min(ang / SUN_ANG_R, 1.0);
   let mu = sqrt(max(1.0 - x * x, 0.0));
   let limb = vec3f(1.0) - vec3f(0.397, 0.503, 0.652) * (1.0 - mu);
-  let rad = F.sunDir.w / (PI * SUN_ANG_R * SUN_ANG_R);
+  let rad = F.sunDir.w * F.astro.w / (PI * SUN_ANG_R * SUN_ANG_R);
   return rad * limb * edge * sampleTrans(camR(), max(dir.y, -0.01));
+}
+
+// ---- the Moon ------------------------------------------------------------
+// Albedo relative to the highlands: the maria at their selenographic positions
+// (lat, lon east towards Mare Crisium, radius; degrees), with ragged edges.
+var<private> MARIA: array<vec3f, 22> = array<vec3f, 22>(
+  vec3f(8.0, -57.0, 18.0), vec3f(28.0, -52.0, 15.0), vec3f(-8.0, -48.0, 14.0),   // Oceanus Procellarum
+  vec3f(32.8, -15.6, 19.0),   // Imbrium
+  vec3f(28.0, 17.5, 11.0),    // Serenitatis
+  vec3f(8.5, 31.4, 14.0),     // Tranquillitatis
+  vec3f(17.0, 59.1, 9.0),     // Crisium
+  vec3f(-7.8, 51.3, 12.0),    // Fecunditatis
+  vec3f(-15.2, 35.5, 5.5),    // Nectaris
+  vec3f(-21.3, -16.6, 11.0),  // Nubium
+  vec3f(-24.4, -38.6, 6.5),   // Humorum
+  vec3f(-10.0, -23.0, 6.0),   // Cognitum
+  vec3f(7.5, -30.9, 8.0),     // Insularum
+  vec3f(13.3, 3.6, 4.0),      // Vaporum
+  vec3f(2.0, 1.0, 3.0),       // Sinus Medii
+  vec3f(56.0, -38.0, 5.0), vec3f(57.0, -15.0, 6.0), vec3f(57.0, 8.0, 6.0), vec3f(56.0, 28.0, 5.0), vec3f(55.0, 45.0, 4.0),   // Frigoris
+  vec3f(1.3, 87.0, 6.0),      // Smythii
+  vec3f(13.0, 86.0, 5.0)      // Marginis
+);
+fn selVec(latDeg: f32, lonDeg: f32) -> vec3f {
+  let la = radians(latDeg);
+  let lo = radians(lonDeg);
+  return vec3f(cos(la) * sin(lo), sin(la), cos(la) * cos(lo));
+}
+fn moonAlbedo(p: vec3f) -> f32 {
+  var mare = 0.0;
+  for (var i = 0; i < 22; i++) {
+    let m = MARIA[i];
+    let d = degrees(acos(clamp(dot(p, selVec(m.x, m.y)), -1.0, 1.0)));
+    let wob = (gnoise(p.xy * 3.5 + vec2f(f32(i) * 3.7, 1.3)) + 0.5 * gnoise(p.yz * 8.0 + f32(i))) * 0.3 * m.z;
+    // overlapping margins add up, so neighbouring maria flow into each other
+    mare += smoothstep(m.z * 1.3 + wob, m.z * 0.7 + wob, d);
+  }
+  mare = smoothstep(0.0, 1.0, min(mare, 1.0));
+  // maria vary in tone; the highlands are mottled with craters
+  let tone = 0.42 + 0.08 * gnoise(p.xy * 5.0 + vec2f(7.0, 2.0));
+  var a = mix(1.0, tone, mare) * (1.0 + 0.10 * gnoise(p.xy * 23.0) + 0.06 * gnoise(p.xy * 61.0 + 4.0));
+  // young bright craters: Tycho with its ray system, Copernicus, Kepler, Aristarchus
+  let dt = degrees(acos(clamp(dot(p, selVec(-43.3, -11.2)), -1.0, 1.0)));
+  let tv = selVec(-43.3, -11.2);
+  let ray = gnoise(vec2f(atan2(dot(p, cross(tv, vec3f(0.0, 1.0, 0.0))), dot(p, vec3f(0.0, 1.0, 0.0))) * 7.0, 0.5));
+  a += 0.9 * exp(-dt / 1.2) + 0.35 * smoothstep(0.1, 0.6, ray) * exp(-dt / 22.0);
+  a += 0.6 * exp(-degrees(acos(clamp(dot(p, selVec(9.6, -20.1)), -1.0, 1.0))) / 1.0);
+  a += 0.4 * exp(-degrees(acos(clamp(dot(p, selVec(8.1, -38.0)), -1.0, 1.0))) / 0.8);
+  a += 0.8 * exp(-degrees(acos(clamp(dot(p, selVec(23.7, -47.4)), -1.0, 1.0))) / 0.6);
+  return a;
+}
+// full-moon disc radiance per unit solar illuminance (~2500 cd/m2 with the mean albedo)
+const MOON_L: f32 = 0.0195;
+// largest pre-exposed radiance the lit disc may reach: the night gain would burn it to a
+// white blob, while the eye still sees the maria (a local adaptation)
+const MOON_DISC_MAX: f32 = 1.5;
+fn moonDisk(dir: vec3f) -> vec3f {
+  let m = F.moonDir.xyz;
+  let R = F.moonUp.w;
+  let c = dot(dir, m);
+  let ang = sqrt(max(2.0 * (1.0 - c), 0.0));
+  let pix = F.screen.w * 2.0 * length(F.camUp.xyz) * 0.75;
+  let edge = 1.0 - smoothstep(R - pix, R + pix, ang);
+  if (edge <= 0.0 || F.moonDir.w <= 0.0) { return vec3f(0.0); }
+  // point on the visible hemisphere and its selenographic direction
+  let q = (dir - m * c) / max(R, 1e-6);
+  let n = normalize(q - m * sqrt(max(1.0 - dot(q, q), 0.0)));
+  let toE = -m;
+  let north = normalize(F.moonUp.xyz - m * dot(F.moonUp.xyz, m));
+  let east = cross(m, north);   // lunar east, towards Mare Crisium = celestial west
+  let p = vec3f(dot(n, east), dot(n, north), dot(n, toE));
+  let alb = moonAlbedo(p);
+  // sunlight: Lommel-Seeliger (no limb darkening) with the opposition surge; the sun lights
+  // it from the scene's own sun direction, so phase and terminator tilt follow geometrically
+  let Ld = F.sunDir.xyz;
+  let mu0 = max(dot(n, Ld), 0.0);
+  let mu = max(dot(n, toE), 1e-3);
+  let cosA = dot(Ld, toE);
+  let surge = (1.0 + 3.5 * exp(-acos(clamp(cosA, -1.0, 1.0)) / 0.12)) / 4.5;
+  var lit = F.sunDir.w * MOON_L * 2.0 / 0.8 * alb * mu0 / (mu0 + mu) * surge;
+  lit *= min(1.0, MOON_DISC_MAX / (F.sunDir.w * MOON_L * F.astro.w));
+  // earthshine: the sunlit Earth (full when the moon is new) lights the night side
+  let es = F.sunDir.w * 2e-4 * (0.5 - 0.5 * cosA) * 0.13 / PI * alb * mu;
+  let col = vec3f(1.04, 1.0, 0.93) * lit + vec3f(0.85, 0.95, 1.15) * es;
+  return col * F.astro.w * edge * sampleTrans(camR(), max(dir.y, -0.01));
 }
 
 fn skyRadiance(dirIn: vec3f, withSun: bool, pixAng: f32) -> vec3f {
@@ -1025,7 +1155,7 @@ fn skyRadiance(dirIn: vec3f, withSun: bool, pixAng: f32) -> vec3f {
 const ENV_CUBE = FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
-@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d_array<f32>;   // layer 0: sun, 1: moon
 @group(0) @binding(3) var sampC: sampler;
 @group(0) @binding(4) var dst: texture_storage_2d_array<rgba16float, write>;
 ` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
@@ -1090,14 +1220,23 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 const SUN_VIS = FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
-@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d_array<f32>;   // layer 0: sun, 1: moon
 @group(0) @binding(3) var sampC: sampler;
 @group(0) @binding(4) var<storage, read_write> sunVis: array<f32, 4>;
 ` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
 var<workgroup> part: array<f32, 8>;
-// one ray per thread (7 rays across the disc), then a tiny reduction
+var<workgroup> partL: array<f32, 8>;
+// Eye adaptation: the gain applied as pre-exposure when the sky gets darker than at sunset
+// (partial adaptation, so night still looks like night). Exactly 1 for brighter skies.
+const ADAPT_REF: f32 = ${ADAPT_REF};
+const ADAPT_POW: f32 = 0.85;
+// one ray per thread (7 rays across the disc), then a tiny reduction; each thread also
+// measures the bare sky luminance in one direction (zenith + a ring at 24 deg elevation)
 @compute @workgroup_size(8)
 fn main(@builtin(local_invocation_index) k: u32) {
+  let la = f32(k) * 0.8975979;
+  let ld = select(normalize(vec3f(cos(la), 0.45, sin(la))), vec3f(0.0, 1.0, 0.0), k == 7u);
+  partL[k] = dot(skyAtmo(ld), vec3f(0.2126, 0.7152, 0.0722)) / F.astro.w;
   let sd = F.sunDir.xyz;
   let tx = normalize(cross(sd, vec3f(0.0, 1.0, 0.0)));
   let ty = cross(tx, sd);
@@ -1114,6 +1253,11 @@ fn main(@builtin(local_invocation_index) k: u32) {
     var acc = 0.0;
     for (var i = 0u; i < 7u; i++) { acc += part[i]; }
     sunVis[0] = acc / 7.0;
+    var lum = 0.0;
+    for (var i = 0u; i < 8u; i++) { lum += partL[i]; }
+    lum *= 0.125;
+    sunVis[1] = clamp(pow(ADAPT_REF / max(lum, 1e-12), ADAPT_POW), 1.0, 1e6);
+    sunVis[2] = lum;
   }
 }
 `;
@@ -1125,7 +1269,7 @@ fn main(@builtin(local_invocation_index) k: u32) {
 const RENDER_BINDINGS = /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
-@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d_array<f32>;   // layer 0: sun, 1: moon
 @group(0) @binding(3) var sampC: sampler;
 `;
 
@@ -1154,7 +1298,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   let aa = vec2f(fwidth(el), fwidth(eh));
   var sunT = 1.0;
   let cl = cloudLayers(d2, pixAng, aa, &sunT);
-  let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
+  let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + (sunDisk(dir) + moonDisk(dir)) * sunT;
   return vec4f(L, 1.0);
 }
 `;
@@ -1168,6 +1312,9 @@ const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
 @group(0) @binding(9) var sampR: sampler;
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
 @group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
+@group(0) @binding(12) var birdRefl: texture_2d<f32>;
+// per bird: (camera-relative centre, projected half-span), (right axis, size), (forward axis, -)
+@group(0) @binding(13) var<storage, read> birdSh: array<vec4f>;
 ` + SKY_RENDER_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
@@ -1226,6 +1373,58 @@ fn lambdaSmith(w: vec3f, cov: vec3f) -> f32 {
   return (1.0 - 1.259 * a + 0.396 * a * a) / (3.535 * a + 2.181 * a * a);
 }
 
+// Soft seagull shadows. Each bird is a wing box and a body box in its own plane; the sun ray
+// from the shaded point is intersected with that plane and the coverage of the solar disc
+// (whose footprint grows with distance: the penumbra) is estimated separably. A low sun puts
+// the birds so far from their shadows that the penumbra swallows them, as in reality.
+fn boxCov(x: f32, a0: f32, a1: f32, w: f32) -> f32 {
+  return clamp((min(a1, x + w) - max(a0, x - w)) / (2.0 * w), 0.0, 1.0);
+}
+fn birdShadow(p: vec3f, Ld: vec3f) -> f32 {
+  var lit = 1.0;
+  let nb = u32(F.windP[1].x);
+  for (var i = 0u; i < nb; i++) {
+    let b0 = birdSh[i * 3u];
+    let q = b0.xyz - p;
+    let t = dot(q, Ld);
+    let reach = b0.w + 0.45 + t * SUN_ANG_R;
+    if (t > 0.0 && dot(q, q) - t * t < reach * reach) {
+      let b1 = birdSh[i * 3u + 1u];
+      let r = b1.xyz;
+      let f = birdSh[i * 3u + 2u].xyz;
+      let u = cross(r, f);
+      let du = dot(Ld, u);
+      let su = select(-1.0, 1.0, du >= 0.0) * max(abs(du), 0.05);
+      let th = dot(q, u) / su;
+      let x = Ld * th - q;
+      let lx = dot(x, r);
+      let lz = dot(x, f);
+      let w = max(th * SUN_ANG_R, 0.02);
+      let s = b1.w;
+      let wing = boxCov(lx, -b0.w, b0.w, w) * boxCov(lz, -0.16 * s, 0.07 * s, w);
+      let body = boxCov(lx, -0.065 * s, 0.065 * s, w) * boxCov(lz, -0.38 * s, 0.36 * s, w);
+      lit *= 1.0 - max(wing, body);
+    }
+  }
+  return lit;
+}
+
+// specular reflection of a distant light (sun or moon) per unit illuminance: anisotropic
+// Gaussian slope distribution with Smith masking
+fn glint(V: vec3f, Ld: vec3f, sl: vec2f, cov: vec3f) -> f32 {
+  let Hv = normalize(V + Ld);
+  let hs = -Hv.xz / max(Hv.y, 1e-3);
+  let dsl = hs - sl;
+  let det = max(cov.x * cov.y - cov.z * cov.z, 1e-10);
+  let e = (dsl.x * dsl.x * cov.y + dsl.y * dsl.y * cov.x - 2.0 * dsl.x * dsl.y * cov.z) / det;
+  let pdf = exp(-0.5 * e) / (2.0 * PI * sqrt(det));
+  let hy2 = Hv.y * Hv.y;
+  let Dm = pdf / max(hy2 * hy2, 1e-6);
+  let G = 1.0 / (1.0 + lambdaSmith(V, cov) + lambdaSmith(Ld, cov));
+  let Fh = fresnelWater(dot(V, Hv));
+  return (Fh * Dm * G / (4.0 * max(V.y, 0.02))) * step(0.0, Ld.y);
+}
+
 fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let a = textureSample(foamTex, sampR, xz * 0.23 + vec2f(0.013, 0.0) * t).r;
   let b = textureSample(foamTex, sampR, xz * 0.71 + vec2f(0.37, 0.71)).g;
@@ -1274,7 +1473,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
-  let sunE = sunIlluminance() * sunVis[0];
+  let sunE = sunIlluminance() * sunVis[0] * select(1.0, birdShadow(in.rel, Ld), Ld.y > 0.0);
   let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
   // average radiance of the whole upper hemisphere (incl. the bright horizon band)
   let skyHemi = skyUp * 0.4 + 0.15 * (
@@ -1285,17 +1484,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let skyN = textureSampleLevel(envCube, sampC, nrm, ENV_MAXMIP - 1.0).rgb;
 
   // ---- sun glitter: anisotropic Gaussian slope distribution ----
-  let Hv = normalize(V + Ld);
-  let hs = -Hv.xz / max(Hv.y, 1e-3);
-  let dsl = hs - sl;
-  let det = max(cov.x * cov.y - cov.z * cov.z, 1e-10);
-  let e = (dsl.x * dsl.x * cov.y + dsl.y * dsl.y * cov.x - 2.0 * dsl.x * dsl.y * cov.z) / det;
-  let pdf = exp(-0.5 * e) / (2.0 * PI * sqrt(det));
-  let hy2 = Hv.y * Hv.y;
-  let Dm = pdf / max(hy2 * hy2, 1e-6);
-  let G = 1.0 / (1.0 + lambdaSmith(V, cov) + lambdaSmith(Ld, cov));
-  let Fh = fresnelWater(dot(V, Hv));
-  let spec = sunE * (Fh * Dm * G / (4.0 * max(V.y, 0.02))) * step(0.0, Ld.y);
+  // the moon lays its own glitter path
+  let Lm = F.moonDir.xyz;
+  let moonE = moonIlluminance();
+  let spec = sunE * glint(V, Ld, sl, cov) + moonE * glint(V, Lm, sl, cov);
 
   // ---- sky reflection ----
   // At grazing angles the *visible* facets are biased towards the viewer (projected-area
@@ -1310,7 +1502,28 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   R.y = abs(R.y) * 0.4 + max(R.y, 0.0) * 0.6;
   R = normalize(R);
   let envLod = clamp(log2(max(2.0 * sig * ENV_TEXELS_PER_RAD, 1.0)), 0.0, ENV_MAXMIP);
-  let refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  var refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  // seagull reflections: the mirror-image bird render, looked up along the reflection ray
+  // (continued 40 m past the surface into the mirror world; flat water maps straight back to
+  // this pixel). Resolved waves displace the lookup; like the sky reflection, the unresolved
+  // slope spread along the view blurs it into a vertical streak instead of sparkling specks.
+  let Rb = reflect(-V, nrm);
+  let Rm = vec3f(Rb.x, -Rb.y, Rb.z) * 40.0;
+  let spread = vec3f(0.0, 2.0 * sigV * 40.0, 0.0);
+  let ca = F.viewProj * vec4f(in.rel + Rm + spread, 1.0);
+  let cb = F.viewProj * vec4f(in.rel + Rm - spread, 1.0);
+  var bRefl = vec4f(0.0);
+  if (ca.w > 0.0 && cb.w > 0.0) {
+    let ua = ca.xy / ca.w * vec2f(0.5, -0.5) + 0.5;
+    let ub = cb.xy / cb.w * vec2f(0.5, -0.5) + 0.5;
+    for (var k = 0; k < 5; k++) {
+      let uv = mix(ua, ub, f32(k) * 0.25);
+      let wk = 3.0 - abs(f32(k) - 2.0);
+      if (all(uv > vec2f(0.0)) && all(uv < vec2f(1.0))) { bRefl += textureSampleLevel(birdRefl, sampC, uv, 0.0) * wk; }
+    }
+    bRefl /= 9.0;
+    refl = refl * (1.0 - bRefl.a) + bRefl.rgb;
+  }
   let NdV = max(dot(nV, V), 0.0);
   // Fresnel from a partially smoothed normal: the long-wave facet plus the grazing-angle
   // statistics of everything finer (visible facets at grazing incidence stay highly reflective)
@@ -1321,7 +1534,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let ambient = skyUp * 1.3 + skyN * 0.5;
   let NdL = max(dot(nrm, Ld), 0.0);
   // upwelling light is diffuse: light it with smooth terms only (no per-pixel normal noise)
-  var body = F.waterCol.rgb * (skyHemi * 1.6 + sunE * max(Ld.y, 0.0) * 0.8);
+  var body = F.waterCol.rgb * (skyHemi * 1.6 + sunE * max(Ld.y, 0.0) * 0.8 + moonE * max(Lm.y, 0.0) * 0.8);
   // light transmitted through the thin upper part of backlit crests
   let crest = clamp((in.height - 0.05) / 0.9, 0.0, 1.0);
   let toSun = max(dot(Ld, -V), 0.0);
@@ -1367,7 +1580,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let foamAmb = skyHemi * 1.0 + skyN * 0.3;
   let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
   // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
-  let foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
+  let foamLit = foamAlb * ((sunE * max(dot(nrm, Ld), 0.0) + moonE * max(dot(nrm, Lm), 0.0)) * 0.318 * 0.5 + foamAmbN * 1.55);
 
   if (F.post.w > 0.5) {
     // debug: r = foam cover, g = clamp(J), b = world foam level-0 weight
@@ -1377,9 +1590,11 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     if (F.post.w > 4.5 && F.post.w < 5.5) { return vec4f(body * (1.0 - Fr), 1.0); }
     if (F.post.w > 5.5 && F.post.w < 6.5) { return vec4f(foamLit, 1.0); }
     if (F.post.w > 6.5 && F.post.w < 7.5) { return vec4f(skyUp, 1.0); }
+    if (F.post.w > 7.5 && F.post.w < 8.5) { return vec4f(bRefl.rgb + vec3f(bRefl.a * 0.3), 1.0); }
     return vec4f(fwl.r, fwl.g, fresh, 1.0) * 0.2;
   }
-  var col = body * (1.0 - Fr) + refl * Fr + spec;
+  // a reflected bird also hides the sun glitter behind it (dark gulls in the sun path)
+  var col = body * (1.0 - Fr) + refl * Fr + spec * (1.0 - bRefl.a);
   col = mix(col, foamLit, foamMask * 0.95);
 
   // ---- aerial perspective ----
@@ -1415,6 +1630,198 @@ fn main() {
     x0 = goal - d.xz;
   }
   outH[0] = dispAt(x0).y;
+}
+`;
+
+// ---- js/wgsl/birds.js ----
+// Seagulls: instanced low-poly birds with articulated wings (shoulder + wrist), lit by the
+// sun (dimmed by clouds), the sky hemisphere above and the darker sea below, with feather
+// translucency when backlit, plus the same aerial perspective as the water.
+
+
+
+const BIRDS = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
+@group(0) @binding(4) var envCube: texture_cube<f32>;
+@group(0) @binding(5) var<storage, read> sunVis: array<f32, 4>;
+` + SKY_RENDER_FUNCS + /* wgsl */ `
+const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
+const SHOULDER: f32 = 0.05;
+const WRIST: f32 = 0.32;
+const SPAN: f32 = 1.36;
+// 1 = render the mirror image below sea level (sampled by the ocean as the birds' reflection)
+override MIRROR: f32 = 0.0;
+
+struct VSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) rel: vec3f,
+  @location(1) nrm: vec3f,
+  @location(2) @interpolate(flat) mat: f32,
+};
+
+fn rot(p: vec2f, a: f32) -> vec2f {
+  let c = cos(a);
+  let s = sin(a);
+  return vec2f(p.x * c - p.y * s, p.x * s + p.y * c);
+}
+
+// i0 = camera-relative position, roll (+ = right wing down)
+// i1 = flight direction (unit), wing beat phase
+// i2 = flap amount (0 glide .. 1 full beat), size
+@vertex fn vs(@location(0) lp: vec3f, @location(1) ln: vec3f, @location(2) pm: vec2f,
+              @location(3) i0: vec4f, @location(4) i1: vec4f, @location(5) i2: vec4f) -> VSOut {
+  let side = select(-1.0, 1.0, lp.x >= 0.0);
+  let ph = i1.w;
+  let amp = i2.x;
+  // gliding: arms raised, hands drooped (the gull "M"); flapping: big shoulder stroke with
+  // the hand lagging behind it
+  let a1 = mix(0.12, 0.10 + 0.62 * sin(ph), amp) * side;
+  let a2 = mix(-0.24, 0.42 * sin(ph - 0.7), amp) * side;
+  var p = lp;
+  var n = ln;
+  if (pm.x > 1.5) {
+    let q = rot(vec2f(p.x - side * WRIST, p.y), a2);
+    p = vec3f(q.x + side * WRIST, q.y, p.z);
+    n = vec3f(rot(n.xy, a2), n.z);
+  }
+  if (pm.x > 0.5) {
+    let q = rot(vec2f(p.x - side * SHOULDER, p.y), a1);
+    p = vec3f(q.x + side * SHOULDER, q.y, p.z);
+    n = vec3f(rot(n.xy, a1), n.z);
+  }
+  // the body rides up on the downstroke
+  p.y += 0.03 * cos(ph) * amp;
+  p = vec3f(rot(p.xy, -i0.w), p.z);
+  n = vec3f(rot(n.xy, -i0.w), n.z);
+  let f = i1.xyz;
+  let r = normalize(vec3f(-f.z, 0.0, f.x));
+  let u = cross(r, f);
+  // keep far birds at least a few pixels wide so they don't shimmer away
+  let pixAng = 2.0 * length(F.camUp.xyz) * F.screen.w;
+  let s = i2.y * clamp(5.0 * pixAng * length(i0.xyz) / SPAN, 1.0, 2.5);
+  var o: VSOut;
+  o.rel = i0.xyz + (r * p.x + u * p.y + f * p.z) * s;
+  o.nrm = r * n.x + u * n.y + f * n.z;
+  if (MIRROR > 0.5) {
+    o.rel.y = -o.rel.y - 2.0 * F.camPos.y;
+    o.nrm.y = -o.nrm.y;
+  }
+  o.pos = F.viewProj * vec4f(o.rel, 1.0);
+  o.mat = pm.y;
+  return o;
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  // the mirror image is shaded as the real bird seen from the mirrored viewpoint; dist is the
+  // full camera -> water -> bird path either way
+  let flip = select(vec3f(1.0), vec3f(1.0, -1.0, 1.0), MIRROR > 0.5);
+  let dist = length(in.rel);
+  let V = -in.rel / dist * flip;
+  var n = normalize(in.nrm) * flip;
+  // thin surfaces: light the side facing the viewer
+  let under = dot(n, V) < 0.0;
+  if (under) { n = -n; }
+  let white = vec3f(0.80, 0.80, 0.78);
+  var alb = white;
+  var trans = 0.35;
+  if (in.mat > 0.5 && in.mat < 1.5) {
+    alb = select(vec3f(0.42, 0.45, 0.48), white, under);
+    trans = select(0.18, 0.35, under);
+  } else if (in.mat > 1.5 && in.mat < 2.5) {
+    alb = vec3f(0.035, 0.035, 0.04);
+    trans = 0.02;
+  } else if (in.mat > 2.5) {
+    alb = vec3f(0.72, 0.52, 0.10);
+    trans = 0.0;
+  }
+
+  let Ld = F.sunDir.xyz;
+  let sunE = sunIlluminance() * sunVis[0] * smoothstep(-0.01, 0.01, Ld.y);
+  let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
+  let skyN = textureSampleLevel(envCube, sampC, normalize(vec3f(n.x, max(n.y, 0.05), n.z)), ENV_MAXMIP - 1.0).rgb;
+  // from below: the sea is much darker than the sky it reflects
+  let amb = mix(skyUp * 0.15, skyN, smoothstep(-0.5, 0.5, n.y));
+  let NdL = dot(n, Ld);
+  let direct = (sunE * max(NdL, 0.0) + moonIlluminance() * max(dot(n, F.moonDir.xyz), 0.0)) * 0.318;
+  // sunlight diffusing through thin feathers when the bird is backlit
+  let back = sunE * max(-NdL, 0.0) * 0.318 * trans;
+  var col = alb * (direct + amb) + white * back;
+
+  let T = exp(-max(F.fogExt.rgb, vec3f(F.fogExt.w)) * dist);
+  let fogCol = skyAtmo(normalize(vec3f(-V.x, max(-V.y, 0.002), -V.z)));
+  col = col * T + fogCol * (1.0 - T);
+  return vec4f(col, 1.0);
+}
+`;
+
+// ---- js/wgsl/stars.js ----
+// Stars from the Yale Bright Star Catalogue: one instanced point glow per star, placed for
+// the observer's sidereal time and latitude, drawn additively where only sky is behind them
+// (depth still at the far plane). Physically scaled: the illuminance of each star's V
+// magnitude, dimmed by atmospheric extinction and clouds, so they emerge on their own as
+// twilight darkens the sky. They twinkle more through the long air path near the horizon.
+
+
+
+const STARS = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
+// illuminance of a V = 0 star above the atmosphere, 10^(-0.4 * 14.18) lux, in renderer
+// units (solar illuminance 1.28e5 lux = 14)
+const STAR_E0: f32 = 2.34e-10;
+const PSF: f32 = 0.8;   // point spread, gaussian sigma in pixels
+
+struct VSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) off: vec2f,
+  @location(1) col: vec3f,
+};
+
+// s0 = RA, Dec (rad), relative illuminance 10^(-0.4 V), twinkle seed; s1 = linear rgb
+@vertex fn vs(@builtin(vertex_index) vi: u32, @location(0) s0: vec4f, @location(1) s1: vec4f) -> VSOut {
+  var o: VSOut;
+  o.pos = vec4f(2.0, 2.0, 0.0, 1.0);   // off screen unless the star is up
+  o.off = vec2f(0.0);
+  o.col = vec3f(0.0);
+  // equatorial -> local east / north / up
+  let H = F.astro.x - s0.x;
+  let cd = cos(s0.y);
+  let sd = sin(s0.y);
+  let cl = cos(F.astro.y);
+  let sl = sin(F.astro.y);
+  let e = -cd * sin(H);
+  let n = sd * cl - cd * sl * cos(H);
+  let u = sd * sl + cd * cl * cos(H);
+  if (u < -0.01) { return o; }
+  // true north lies at scene azimuth F.astro.z (scene azimuth a: direction (sin a, 0, -cos a))
+  let co = cos(F.astro.z);
+  let so = sin(F.astro.z);
+  let dir = vec3f(e * co + n * so, u, e * so - n * co);
+  if (dot(dir, F.moonDir.xyz) > cos(F.moonUp.w)) { return o; }   // behind the moon
+  var clip = F.viewProj * vec4f(dir, 0.0);   // at infinity: depth 0 (reverse-Z far plane)
+  if (clip.w <= 0.0) { return o; }
+
+  var d2 = dir;
+  d2.y = max(d2.y, 0.0005);
+  d2 = normalize(d2);
+  var sunT = 1.0;
+  let cloud = cloudLayers(d2, 0.0, vec2f(-1.0), &sunT);
+  let t = F.camPos.w;
+  let amp = 0.06 + 0.45 * (1.0 - smoothstep(0.03, 0.5, u));
+  let tw = max(0.15, 1.0 + amp * (0.6 * sin(t * 13.7 + s0.w * 61.0) + 0.4 * sin(t * 29.3 + s0.w * 17.0)));
+  let E = STAR_E0 * s0.z * tw * F.astro.w * (1.0 - cloud.a);
+  let pixAng = 2.0 * length(F.camUp.xyz) * F.screen.w;
+  // peak radiance of the gaussian spot carrying the star's illuminance
+  o.col = s1.rgb * sampleTrans(camR(), max(u, 0.0)) * (E / (2.0 * PI * PSF * PSF * pixAng * pixAng));
+
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
+                                vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let c = corners[vi] * (3.0 * PSF);
+  clip = vec4f(clip.xy + c * 2.0 * F.screen.zw * clip.w, 0.0, clip.w);
+  o.pos = clip;
+  o.off = c;
+  return o;
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  return vec4f(in.col * exp(-0.5 * dot(in.off, in.off) / (PSF * PSF)), 0.0);
 }
 `;
 
@@ -1550,11 +1957,415 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
 }
 `;
 
+// ---- js/stars.js ----
+// Generated by tools/make-stars.mjs from the Yale Bright Star Catalogue, 5th revised ed.
+// (Hoffleit & Warren 1991, CDS V/50): 5080 stars down to V = 6, J2000, brightest first.
+// 6 bytes per star, little endian: RA uint16 (2 pi / 65536), Dec int16 (pi/2 / 32767),
+// V uint8 ((V + 2) * 20), B-V int8 (* 50). Decoded by decodeStars() in astro.js.
+const STAR_COUNT = 5080;
+const STAR_DATA = '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uDWi2ow2Ezh9LowMV0EFy4z7qUdSP4xKBklsO4xAhnAnvYw0mIR+N4wwP4YjGow5CqMlZoxFgKUSOoxQpqUrOowEN6+n3owMD744SIwB+MfuAoz9+NT46YwDX+JFnIxP1gGGQY0UFwx+Po0GgBY2II0GtBi8KI0C4SJxSI05ZiM+R439NSqzWY38yy+OEo0MlzPw6I0xNzZ+uY1L5DhLMI0O1j9o8o0KqE31y434106gI40tk3SnL403En0hp40ou549yo34e6lS440Aq7VJ0o37pbh0D41OeMKWW40TKc8l3Y0MHtAJ/I1Yq9NcS41AieoTaI0WYfH9+Y053RLis40CvhV+TY38lECe2o1D7EJ0EY0V1lJK640RL3vK041P2YAtk41Lz4z26I0Xwq+QO41M3rMRI40/IL50bY0ZQMF3K40alMf9To38L9xMIo35Pd6pPo0K3ejqKo3/t+x/VI0Nlf31BI1/2v1vYI0AwzF9S402JTIty40TWDmucI0YQUGbp40/HEKv9o329k1ZRo0E4k/9J40Gr1EjGY1OhVagv41LSlzF340lVml59I0CPXWAOY0fIo9/lY04BLvmYI021cPcRY1Tu86aso0Bk9VCR404StxYDo0kfd6bto048/inB408/QRyGY1TRSJN/o0cdSshVI0ZNDnF3I0ijkEYno38+EQ6+Y34Y0p9z434TlLBv40nKmee64355o88t40EUJkSjo37b6ODAo0bE8GZH41P4sdrOI0IOtIS6Y0R7dG/QI0UVPgD9Y1QC/2xDo1UtQgYGI0aowhylY1FlSjZD436JjARwI33oTF4Fo0IZTV5c41AEjiv2Y37QDoIMY1Gd0g0841a3lHCe41Sl1iwoo05r2XRDY1F/pfQro38AKcaNI36cavT740eELgr2o0rssXtvo35j9aVIY33bQYKTY77bTbfU478sDm7/o4woDtM+I78GVM7yY770VdYzI734Wj2vo77xGuivI4st3A73o5Q2nDkCY4vIHFKq447Y3L6II4CfHXEN44ManpPw47/mpc72Y46G7FFS47+PbeiwI4rCLf+OY5AMsqf4o4Heum67I4Tb+nfJI74B/G8aI4UgfJ5O44wu/jc7I4ocPmDEY5Cqv4xG45Q0gVcpo4CDCSAHY4+VSXdTo4DvyhUIo780kGwlY4k21RFwY74PlqAtI4No2hzQY4fDXAY/475fXlL5Y4VUI92x448A6NPqY793qlvno446Mu/D478AOgV84443RRXGY4ufyfoWY5SdCzFco4czTPLGo4L+0VE/o75E02EwI5OkU4THY5MW09xt441Ul7UvY72MXShTY5E2IIwFY4Dq40x044woplHCI4GlMGCHI4I98MGyY5LusnP6Y4J982LAY45QNZuHI41dNw05o5TCOcxA440Ou6ajY5Kl+3MxI4uzPXPPI4FUwCy+476VRSQw479hR9rLY4ApCALq44RzygQL44Eiimbzo76vzBL9I5VND7boI75+02/y474LFXZ3o44rWQWtI77BmbjjI75fXmfo478AH712Y5Qa5+3po4ARKZ7N45SHamb+44GELgr2o4rItDGJ477vdPQDo4cXduxwI4z9N1xwY4SJeeLPY5QleuTWI4E9PWUzo4Omf5bi44ukgLv9I5R3wN5445b7g894Y4B6S50DY4EiTZh+Y794jaq+Y4WjEn5YY76PFaoEo4B6mIMwY5UAGZOuo76IHJ2XY48S4iTF45EfZkDDI7/VZ2BJo4eHaqyz44G46pXGY4yDbnYIo7/o7kxwY79A75xJI46vMMPKY4KT8QwOI4CvszdUI4z6dD78I44qNMSN45VdNzjqY4bB/dXDI5KigZFP49QOg279I8XmztW+I8BUEuTD49Glk5INI82S1En+o8WwFcrvY/58VnCCo8vjWJbV48d23bmp48L+3p2q482W4apxY8LmqLHX48boawq1o8497KPoI/8ycd/yY8FTMzibI8QpdWOq49Nge5J4Y82z//8tI84oxVpwI9LURrqz48FaCUfEI//Azo3rI8ynUABHI/7JUMW6I9BD0kZYI/430i1vY8X0krlto9Rlkxpuo8+HVOGL49Q3FODAo/651i1Jo8YfmEbX49MqmFaH48xQWpjOo8XK4Jibo8RuIO17I81z5jH/I8zYa2hvI/6l8XU5Y8AO8Zj8I8u5MdWOI8Ka8piqo9FJNTPUY/6oN3vFo8ZvesFQI9PChtoM49KUCNtR4/9lEVg7o9AkV4wPo8xoXZcw48C/Xpcq48Z6nvYqI84HHwSqI//p4Cnw48V74P5n48K6Y2oRo/8A5NxzI//ZJTd/Y82EpV83I/7WJ5A6Y8V8qCYxY8zKKYd2I9B0bI1DI9NLr1Ito8jG81DA4/8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';
+
+// ---- js/astro.js ----
+// Where and when: observer locations, the sun's position (low-precision Meeus / NOAA
+// formulae, ~0.01 deg) and local sidereal time, plus decoding of the packed star catalogue.
+// The scene's sun elevation slider picks the time: the evening moment on the chosen date
+// when the sun reaches that elevation.
+const DEG = Math.PI / 180;
+
+const LOCATIONS = {
+  lajolla: { name: 'La Jolla', lat: 32.8328, lon: -117.2713, tz: 'America/Los_Angeles' },
+  santorini: { name: 'Santorini', lat: 36.4167, lon: 25.4318, tz: 'Europe/Athens' },
+  split: { name: 'Split', lat: 43.5081, lon: 16.4402, tz: 'Europe/Zagreb' },
+  keywest: { name: 'Key West', lat: 24.5551, lon: -81.7800, tz: 'America/New_York' },
+};
+
+// today's calendar date (YYYY-MM-DD) in a time zone
+function todayIn(tz) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+}
+
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+// d: days since J2000.0 (2000-01-01 12:00 UT)
+function sunRaDec(d) {
+  const g = (357.529 + 0.98560028 * d) * DEG;
+  const L = (280.459 + 0.98564736 * d + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * DEG;
+  const e = (23.439 - 0.00000036 * d) * DEG;
+  return [Math.atan2(Math.cos(e) * Math.sin(L), Math.cos(L)), Math.asin(Math.sin(e) * Math.sin(L)), L];
+}
+const gmst = (d) => ((280.46061837 + 360.98564736629 * d) % 360) * DEG;
+const J2000_MS = Date.UTC(2000, 0, 1, 12);
+
+// The evening moment on the local calendar date dateStr when the sun stands at elevDeg.
+// Returns local sidereal time and latitude (rad), the sun's true azimuth (rad from north
+// through east) and the UTC time in ms. Elevations above the day's maximum give local noon.
+function solveSky(loc, dateStr, elevDeg) {
+  const [y, m, day] = dateStr.split('-').map(Number);
+  const lat = loc.lat * DEG, lon = loc.lon * DEG;
+  // start at local mean noon and step along the hour angle
+  let d = (Date.UTC(y, m - 1, day, 12) - J2000_MS) / 864e5 - loc.lon / 360;
+  const sinE = Math.sin(elevDeg * DEG);
+  for (let i = 0; i < 5; i++) {
+    const [ra, dec] = sunRaDec(d);
+    const c = (sinE - Math.sin(lat) * Math.sin(dec)) / (Math.cos(lat) * Math.cos(dec));
+    const H = Math.acos(Math.max(-1, Math.min(1, c)));
+    d += wrapAngle(H - (gmst(d) + lon - ra)) / (2 * Math.PI * 1.00273790935);
+  }
+  const [ra, dec] = sunRaDec(d);
+  const lst = gmst(d) + lon;
+  const [sunAz] = altAz(ra, dec, lst, lat);
+  return { d, lst: wrapAngle(lst), lat, sunAz, utcMs: J2000_MS + d * 864e5 };
+}
+
+// equatorial (rad) -> [azimuth from north through east, altitude] for sidereal time lst
+function altAz(ra, dec, lst, lat) {
+  const ha = lst - ra;
+  const east = -Math.cos(dec) * Math.sin(ha);
+  const north = Math.sin(dec) * Math.cos(lat) - Math.cos(dec) * Math.sin(lat) * Math.cos(ha);
+  const up = Math.sin(dec) * Math.sin(lat) + Math.cos(dec) * Math.cos(lat) * Math.cos(ha);
+  return [Math.atan2(east, north), Math.asin(Math.max(-1, Math.min(1, up)))];
+}
+
+// The Moon: main periodic terms of Meeus' lunar theory (Astronomical Algorithms ch. 47),
+// good to ~0.2 deg. Returns geocentric RA, Dec (rad), distance (km) and ecliptic longitude.
+function moonRaDec(d) {
+  const T = d / 36525;
+  const r = (x) => (x % 360) * DEG;
+  const Lp = r(218.3164477 + 481267.88123421 * T);
+  const D = r(297.8501921 + 445267.1114034 * T);
+  const M = r(357.5291092 + 35999.0502909 * T);
+  const Mp = r(134.9633964 + 477198.8675055 * T);
+  const F = r(93.2720950 + 483202.0175233 * T);
+  const s = Math.sin, c = Math.cos;
+  const lon = Lp + DEG * (6.289 * s(Mp) + 1.274 * s(2 * D - Mp) + 0.658 * s(2 * D) + 0.214 * s(2 * Mp)
+    - 0.186 * s(M) - 0.114 * s(2 * F) + 0.059 * s(2 * D - 2 * Mp) + 0.057 * s(2 * D - M - Mp)
+    + 0.053 * s(2 * D + Mp) + 0.046 * s(2 * D - M) - 0.041 * s(M - Mp) - 0.035 * s(D) - 0.030 * s(M + Mp));
+  const lat = DEG * (5.128 * s(F) + 0.281 * s(Mp + F) + 0.278 * s(Mp - F) + 0.173 * s(2 * D - F)
+    + 0.055 * s(2 * D - Mp + F) - 0.046 * s(2 * D - Mp - F) + 0.033 * s(2 * D + F) + 0.017 * s(2 * Mp + F));
+  const dist = 385000.56 - 20905.355 * c(Mp) - 3699.111 * c(2 * D - Mp) - 2955.968 * c(2 * D)
+    - 569.925 * c(2 * Mp) + 48.888 * c(M) + 246.158 * c(2 * D - 2 * Mp) - 152.138 * c(2 * D - M - Mp)
+    - 170.733 * c(2 * D + Mp) - 204.586 * c(2 * D - M) - 129.620 * c(M - Mp) + 108.743 * c(D) + 104.755 * c(M + Mp);
+  const e = (23.439 - 0.00000036 * d) * DEG;
+  const ra = Math.atan2(s(lon) * c(e) - Math.tan(lat) * s(e), c(lon));
+  const dec = Math.asin(s(lat) * c(e) + c(lat) * s(e) * s(lon));
+  return { ra, dec, dist, lon };
+}
+
+// The Moon seen from the observer at day d: true azimuth and topocentric altitude (rad),
+// angular radius, illuminated fraction, waxing flag, and the moonlight illuminance above
+// the atmosphere (lux) from its phase (Allen's magnitude law) and distance.
+function moonFor(d, lst, lat) {
+  const m = moonRaDec(d);
+  const [az, altGeo] = altAz(m.ra, m.dec, lst, lat);
+  const alt = altGeo - Math.asin(6378.14 / m.dist) * Math.cos(altGeo);   // parallax, up to ~1 deg
+  const [sra, sdec, sunLon] = sunRaDec(d);
+  const cosElong = Math.sin(sdec) * Math.sin(m.dec) + Math.cos(sdec) * Math.cos(m.dec) * Math.cos(m.ra - sra);
+  const phase = Math.PI - Math.acos(Math.max(-1, Math.min(1, cosElong)));   // sun-moon-earth angle
+  const pDeg = phase / DEG;
+  const mag = -12.73 + 0.026 * pDeg + 4e-9 * pDeg ** 4 + 5 * Math.log10(m.dist / 384400);
+  return {
+    az, alt, dist: m.dist, radius: Math.asin(1737.4 / m.dist),
+    illum: (1 + Math.cos(phase)) / 2, waxing: Math.sin(m.lon - sunLon) > 0,
+    lux: Math.pow(10, -0.4 * (mag + 14.18)),
+  };
+}
+
+// The north ecliptic pole (~ the Moon's north, within 1.5 deg) for orienting the lunar face
+const ECLIPTIC_POLE = [18 * 15 * DEG, (90 - 23.439) * DEG];
+
+// Linear sRGB (luminance 1) of a blackbody star with colour index B-V: Ballesteros (2012)
+// temperature, Kim et al. (2002) Planckian locus chromaticity.
+function starColor(bv, out, o) {
+  const T = Math.max(1667, Math.min(25000, 4600 * (1 / (0.92 * bv + 1.7) + 1 / (0.92 * bv + 0.62))));
+  const t = 1e3 / T, t2 = t * t, t3 = t2 * t;
+  const x = T <= 4000 ? -0.2661239 * t3 - 0.2343589 * t2 + 0.8776956 * t + 0.179910
+    : -3.0258469 * t3 + 2.1070379 * t2 + 0.2226347 * t + 0.240390;
+  const y = T <= 2222 ? -1.1063814 * x ** 3 - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
+    : T <= 4000 ? -0.9549476 * x ** 3 - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+      : 3.0817580 * x ** 3 - 5.87338670 * x * x + 3.75112997 * x - 0.37001483;
+  const X = x / y, Z = (1 - x - y) / y;
+  const r = Math.max(0, 3.2406 * X - 1.5372 - 0.4986 * Z);
+  const g = Math.max(0, -0.9689 * X + 1.8758 + 0.0415 * Z);
+  const b = Math.max(0, 0.0557 * X - 0.2040 + 1.0570 * Z);
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  out[o] = r / lum; out[o + 1] = g / lum; out[o + 2] = b / lum;
+}
+
+// Packed catalogue (see stars.js) -> 8 floats per star:
+// RA, Dec (rad), relative illuminance 10^(-0.4 V), twinkle seed, linear rgb, 0
+function decodeStars(b64, count) {
+  const bin = atob(b64);
+  const dv = new DataView(new Uint8Array(Array.from(bin, (ch) => ch.charCodeAt(0))).buffer);
+  const out = new Float32Array(count * 8);
+  for (let i = 0; i < count; i++) {
+    const p = i * 6, o = i * 8;
+    out[o] = (dv.getUint16(p, true) / 65536) * 2 * Math.PI;
+    out[o + 1] = (dv.getInt16(p + 2, true) / 32767) * (Math.PI / 2);
+    out[o + 2] = Math.pow(10, -0.4 * (dv.getUint8(p + 4) / 20 - 2));
+    out[o + 3] = ((i * 0.618034) % 1) * 10;
+    starColor(dv.getInt8(p + 5) / 50, out, o + 4);
+  }
+  return out;
+}
+
+// ---- js/birds.js ----
+// Seagulls. A few small flocks simulated on the CPU: boids steering towards waypoints that
+// circle an anchor lazily following the camera, so the birds stay around wherever you fly.
+// Drawn as instanced low-poly gulls with articulated wings by wgsl/birds.js.
+// All state lives in preallocated typed arrays (no per-frame garbage).
+const MAX_BIRDS = 64;
+const BIRD_FLOATS = 12;   // per instance: rel pos + roll, forward + flap phase, flap amount + size
+// per bird for the ocean's shadow test: rel pos + projected half-span, right axis + size, forward
+const SHADOW_FLOATS = 12;
+const FLOCKS = 4;
+const TAU = Math.PI * 2;
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Gull mesh in bird space (x right, y up, z forward; 1.36 m wingspan). 8 floats per vertex:
+// position, normal, part (0 body, 1 inner wing, 2 hand), material (0 white, 1 wing: grey above
+// and white below, 2 black wingtip, 3 beak). Non-indexed triangle list.
+function buildBirdMesh() {
+  const out = [];
+  const vtx = (x, y, z, nx, ny, nz, part, mat) => [x, y, z, nx, ny, nz, part, mat];
+  const tri = (a, b, c) => out.push(...a, ...b, ...c);
+  const quad = (a, b, c, d) => { tri(a, b, c); tri(a, c, d); };
+
+  // body: elliptical rings lofted along z, wings attach at y = 0 (upper body)
+  const RINGS = [
+    // z, half width, half height, centre y
+    [-0.30, 0.010, 0.008, -0.010],
+    [-0.20, 0.045, 0.040, -0.018],
+    [-0.04, 0.068, 0.066, -0.022],
+    [0.10, 0.058, 0.058, -0.012],
+    [0.18, 0.034, 0.038, 0.012],
+    [0.235, 0.042, 0.042, 0.028],
+    [0.285, 0.016, 0.018, 0.028],
+  ];
+  const SEG = 8;
+  const ringV = (r, k, mat) => {
+    const a = (k / SEG) * TAU, c = Math.cos(a), s = Math.sin(a);
+    const nl = Math.hypot(c * r[2], s * r[1]);
+    return vtx(c * r[1], r[3] + s * r[2], r[0], (c * r[2]) / nl, (s * r[1]) / nl, 0, 0, mat);
+  };
+  for (let i = 0; i + 1 < RINGS.length; i++) {
+    for (let k = 0; k < SEG; k++) {
+      quad(ringV(RINGS[i], k, 0), ringV(RINGS[i], k + 1, 0), ringV(RINGS[i + 1], k + 1, 0), ringV(RINGS[i + 1], k, 0));
+    }
+  }
+  const head = RINGS[RINGS.length - 1];
+  const tip = vtx(0, 0.022, 0.36, 0, 0, 1, 0, 3);
+  for (let k = 0; k < SEG; k++) tri(ringV(head, k, 3), ringV(head, k + 1, 3), tip);
+
+  const flat = (x, y, z, part, mat) => vtx(x, y, z, 0, 1, 0, part, mat);
+  // tail
+  quad(flat(-0.035, -0.012, -0.20, 0, 0), flat(0.035, -0.012, -0.20, 0, 0),
+    flat(0.075, -0.016, -0.38, 0, 0), flat(-0.075, -0.016, -0.38, 0, 0));
+  // wings: inner arm, grey hand, black tip (swept back)
+  const WING = [
+    // part, material, inner x, leading z, trailing z, outer x, leading z, trailing z
+    [1, 1, 0.05, 0.07, -0.13, 0.32, 0.06, -0.12],
+    [2, 1, 0.32, 0.06, -0.12, 0.54, -0.01, -0.13],
+    [2, 2, 0.54, -0.01, -0.13, 0.68, -0.13, -0.16],
+  ];
+  for (const s of [1, -1]) {
+    for (const [part, mat, x0, l0, t0, x1, l1, t1] of WING) {
+      quad(flat(s * x0, 0, l0, part, mat), flat(s * x1, 0, l1, part, mat),
+        flat(s * x1, 0, t1, part, mat), flat(s * x0, 0, t0, part, mat));
+    }
+  }
+  return new Float32Array(out);
+}
+
+function createBirds(seed = 1) {
+  const rnd = mulberry32(seed);
+  const range = (a, b) => a + (b - a) * rnd();
+  const n = MAX_BIRDS;
+  const pos = new Float64Array(n * 3), vel = new Float32Array(n * 3);
+  const form = new Float32Array(n * 3);   // slot offset from the flock waypoint
+  const cruise = new Float32Array(n), freq = new Float32Array(n), size = new Float32Array(n);
+  const phase = new Float32Array(n), amp = new Float32Array(n), bank = new Float32Array(n);
+  const burst = new Uint8Array(n), burstT = new Float32Array(n);
+  const inst = new Float32Array(n * BIRD_FLOATS);
+  const shadow = new Float32Array(n * SHADOW_FLOATS);
+
+  // Flocks start at fixed bearings around the camera (angle 0 = +x, -pi/2 = straight ahead
+  // of the start view) and slowly drift around it.
+  const FLOCK_INIT = [
+    // bearing, distance (m), altitude (m), orbit radius (m)
+    [-1.75, 70, 12, 30],
+    [-1.20, 220, 28, 60],
+    [0.90, 120, 18, 45],
+    [2.60, 65, 9, 28],
+  ];
+  const fAng = new Float64Array(FLOCKS), fRad = new Float32Array(FLOCKS), fDrift = new Float32Array(FLOCKS);
+  const fAx = new Float64Array(FLOCKS), fAz = new Float64Array(FLOCKS);
+  const fAlt = new Float32Array(FLOCKS), fOrbR = new Float32Array(FLOCKS);
+  const fTh = new Float64Array(FLOCKS), fDir = new Float32Array(FLOCKS);
+  const wx = new Float64Array(FLOCKS), wy = new Float64Array(FLOCKS), wz = new Float64Array(FLOCKS);
+  for (let f = 0; f < FLOCKS; f++) {
+    const [a, d, h, r] = FLOCK_INIT[f];
+    fAng[f] = a; fRad[f] = d; fAlt[f] = h; fOrbR[f] = r;
+    fDrift[f] = range(-0.006, 0.006);
+    fTh[f] = range(0, TAU);
+    fDir[f] = rnd() < 0.5 ? -1 : 1;
+  }
+  for (let i = 0; i < n; i++) {
+    const a = range(0, TAU), r = 12 * Math.sqrt(rnd());
+    form[i * 3] = Math.cos(a) * r; form[i * 3 + 1] = range(-3, 3); form[i * 3 + 2] = Math.sin(a) * r;
+    cruise[i] = range(8.5, 11.5);
+    freq[i] = range(2.6, 3.4);
+    size[i] = range(0.88, 1.1);
+    phase[i] = range(0, TAU);
+    burstT[i] = range(0, 6);
+  }
+
+  function spawn(i, f) {
+    const o = i * 3;
+    pos[o] = wx[f] + form[o] + range(-4, 4);
+    pos[o + 1] = Math.max(wy[f] + form[o + 1], 6);
+    pos[o + 2] = wz[f] + form[o + 2] + range(-4, 4);
+    // fly along the orbit
+    const s = fDir[f] * cruise[i];
+    vel[o] = -Math.sin(fTh[f]) * s; vel[o + 1] = 0; vel[o + 2] = Math.cos(fTh[f]) * s;
+    amp[i] = 0; bank[i] = 0;
+  }
+
+  let time = 0, first = true;
+
+  function update(dt, cx, cy, cz) {
+    time += dt;
+    for (let f = 0; f < FLOCKS; f++) {
+      fAng[f] += fDrift[f] * dt;
+      const tx = cx + Math.cos(fAng[f]) * fRad[f], tz = cz + Math.sin(fAng[f]) * fRad[f];
+      let respawn = first;
+      const ox = cx - fAx[f], oz = cz - fAz[f], od = Math.hypot(ox, oz);
+      if (first) {
+        fAx[f] = tx; fAz[f] = tz;
+      } else if (od > 900) {
+        // left far behind (fast flight): reappear far ahead, then drift back into place
+        fAx[f] = cx + (ox / od) * 600; fAz[f] = cz + (oz / od) * 600;
+        respawn = true;
+      } else {
+        const k = Math.min(1, dt * 0.08);
+        fAx[f] += (tx - fAx[f]) * k; fAz[f] += (tz - fAz[f]) * k;
+      }
+      const R = fOrbR[f] * (1 + 0.3 * Math.sin(time * 0.05 + f * 1.7));
+      fTh[f] += dt * fDir[f] * 7.5 / R;
+      wx[f] = fAx[f] + Math.cos(fTh[f]) * R;
+      wy[f] = fAlt[f] + 5 * Math.sin(fTh[f] * 0.37 + f);
+      wz[f] = fAz[f] + Math.sin(fTh[f]) * R;
+      if (respawn) for (let i = f; i < n; i += FLOCKS) spawn(i, f);
+    }
+    first = false;
+
+    for (let i = 0; i < n; i++) {
+      const f = i % FLOCKS, o = i * 3;
+      const px = pos[o], py = pos[o + 1], pz = pos[o + 2];
+      const vx = vel[o], vy = vel[o + 1], vz = vel[o + 2];
+      // seek this bird's slot around the waypoint
+      const gx = wx[f] + form[o] - px, gy = Math.max(wy[f] + form[o + 1], 6) - py, gz = wz[f] + form[o + 2] - pz;
+      const gk = cruise[i] / (Math.hypot(gx, gy, gz) + 1e-6);
+      let dx = gx * gk, dy = gy * gk, dz = gz * gk;
+      // flockmates: separation, alignment, cohesion
+      let cnt = 0, ax = 0, ay = 0, az = 0, mx = 0, my = 0, mz = 0;
+      for (let j = f; j < n; j += FLOCKS) {
+        if (j === i) continue;
+        const q = j * 3;
+        const rx = pos[q] - px, ry = pos[q + 1] - py, rz = pos[q + 2] - pz;
+        const d2 = rx * rx + ry * ry + rz * rz;
+        if (d2 > 1600) continue;
+        cnt++;
+        ax += vel[q]; ay += vel[q + 1]; az += vel[q + 2];
+        mx += rx; my += ry; mz += rz;
+        if (d2 < 16) {
+          const k = 6 / Math.max(d2, 0.25);
+          dx -= rx * k; dy -= ry * k; dz -= rz * k;
+        }
+      }
+      if (cnt) {
+        const ic = 1 / cnt;
+        dx += (ax * ic - vx) * 0.3 + mx * ic * 0.04;
+        dy += (ay * ic - vy) * 0.3 + my * ic * 0.04;
+        dz += (az * ic - vz) * 0.3 + mz * ic * 0.04;
+      }
+      // stay clear of the waves and out of the camera's face
+      if (py < 5) dy += (5 - py) * 2;
+      const ex = px - cx, ey = py - cy, ez = pz - cz, e2 = ex * ex + ey * ey + ez * ez;
+      if (e2 < 100) {
+        const k = 40 / Math.max(e2, 1);
+        dx += ex * k; dy += ey * k; dz += ez * k;
+      }
+      dy = Math.max(-3.5, Math.min(3.5, dy));
+      let accx = (dx - vx) * 1.2, accy = (dy - vy) * 1.2, accz = (dz - vz) * 1.2;
+      const al = Math.hypot(accx, accy, accz);
+      if (al > 6) { const k = 6 / al; accx *= k; accy *= k; accz *= k; }
+      let nvx = vx + accx * dt, nvy = vy + accy * dt, nvz = vz + accz * dt;
+      let sp = Math.hypot(nvx, nvy, nvz);
+      const cs = Math.max(6, Math.min(15, sp));
+      nvx *= cs / sp; nvy *= cs / sp; nvz *= cs / sp; sp = cs;
+      vel[o] = nvx; vel[o + 1] = nvy; vel[o + 2] = nvz;
+      pos[o] = px + nvx * dt; pos[o + 1] = py + nvy * dt; pos[o + 2] = pz + nvz * dt;
+
+      // bank into turns (right vector of the flight direction is (-fz, 0, fx))
+      const hs = Math.hypot(nvx, nvz) + 1e-6;
+      const lat = (-accx * nvz + accz * nvx) / hs;
+      const tb = Math.max(-0.9, Math.min(0.9, Math.atan2(lat, 9.81) * 1.4));
+      bank[i] += (tb - bank[i]) * Math.min(1, dt * 3);
+
+      // wing beat: flap when climbing or slow and in occasional bursts, glide otherwise
+      burstT[i] -= dt;
+      if (burstT[i] <= 0) {
+        burst[i] ^= 1;
+        burstT[i] = burst[i] ? range(0.8, 2.2) : range(3, 10);
+      }
+      const tgt = Math.max(0, Math.min(1, nvy * 0.45 + (cruise[i] - sp) * 0.35 + burst[i]));
+      amp[i] += (tgt - amp[i]) * Math.min(1, dt * 2.5);
+      phase[i] = (phase[i] + dt * TAU * freq[i]) % TAU;
+
+      const b = i * BIRD_FLOATS, is = 1 / sp;
+      inst[b] = pos[o] - cx; inst[b + 1] = pos[o + 1] - cy; inst[b + 2] = pos[o + 2] - cz; inst[b + 3] = bank[i];
+      inst[b + 4] = nvx * is; inst[b + 5] = nvy * is; inst[b + 6] = nvz * is; inst[b + 7] = phase[i];
+      inst[b + 8] = amp[i]; inst[b + 9] = size[i]; inst[b + 10] = 0; inst[b + 11] = 0;
+
+      // shadow caster: wing plane axes with the roll applied (matches the vertex shader) and
+      // the half-span shortened by the current wing angles
+      const fx = inst[b + 4], fy = inst[b + 5], fz = inst[b + 6];
+      const rx0 = -fz / hs * sp, rz0 = fx / hs * sp;
+      const ux = -rz0 * fy, uy = rz0 * fx - rx0 * fz, uz = rx0 * fy;
+      const cr = Math.cos(bank[i]), sr = Math.sin(bank[i]);
+      const a1 = 0.12 + (0.10 + 0.62 * Math.sin(phase[i]) - 0.12) * amp[i];
+      const a2 = -0.24 + (0.42 * Math.sin(phase[i] - 0.7) + 0.24) * amp[i];
+      const s = i * SHADOW_FLOATS;
+      shadow[s] = inst[b]; shadow[s + 1] = inst[b + 1]; shadow[s + 2] = inst[b + 2];
+      shadow[s + 3] = (0.05 + 0.27 * Math.cos(a1) + 0.36 * Math.cos(a1 + a2)) * size[i];
+      shadow[s + 4] = rx0 * cr - ux * sr; shadow[s + 5] = -uy * sr; shadow[s + 6] = rz0 * cr - uz * sr;
+      shadow[s + 7] = size[i];
+      shadow[s + 8] = fx; shadow[s + 9] = fy; shadow[s + 10] = fz; shadow[s + 11] = 0;
+    }
+  }
+
+  return { inst, shadow, update };
+}
+
 // ---- js/main.js ----
 // WebGPU ocean — custom renderer.
 // FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
 // All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
 // apart from the unavoidable swap-chain view and command buffer objects).
+
+
+
+
+
 
 
 
@@ -1587,6 +2398,7 @@ const P = {
   clouds: 0.40,
   veil: 0.36,
   bloom: 0.10,
+  birds: 24,           // seagull count
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -1613,6 +2425,13 @@ function mat4Mul(out, a, b) {
     out[c * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
     out[c * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
   }
+}
+
+// renderer units per lux (solar illuminance above the atmosphere, 1.28e5 lux, is 14)
+const LUX = 14 / 1.28e5;
+// scene direction for a true azimuth (already turned by the compass offset) and altitude
+function sceneDir(out, o, az, alt) {
+  out[o] = Math.sin(az) * Math.cos(alt); out[o + 1] = Math.sin(alt); out[o + 2] = -Math.cos(az) * Math.cos(alt);
 }
 
 async function main() {
@@ -1685,7 +2504,7 @@ async function main() {
     computePipe(RGBA8_MIPS, 'rgba8 mips'),
     computePipe(TRANS_LUT, 'transmittance'),
     computePipe(MS_LUT, 'multiscatter'),
-    computePipe(SKYVIEW_LUT, 'skyview'),
+    computePipe(SKYVIEW_LUT, 'skyview sun'),
     computePipe(ENV_CUBE, 'env cube'),
     computePipe(CUBE_MIPS, 'cube mips'),
     computePipe(FOAM_UPDATE, 'foam update'),
@@ -1764,7 +2583,10 @@ async function main() {
   });
   const transLUT = mkLut(256, 64, 'transmittance');
   const msLUT = mkLut(32, 32, 'multiscatter');
-  const skyLUT = mkLut(SKY_W, SKY_H, 'skyview');
+  // sky-view LUT layers: 0 = sunlit sky, 1 = moonlit sky
+  const skyLUT = device.createTexture({
+    label: 'skyview', size: [SKY_W, SKY_H, 2], format: 'rgba16float', usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
+  });
   const envTex = device.createTexture({
     label: 'env cube', size: [ENV_SIZE, ENV_SIZE, 6], format: 'rgba16float', mipLevelCount: ENV_MIPS,
     usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
@@ -1778,15 +2600,21 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
-  const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
-  const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
+  const frameUBO = mkBuf(432, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  // [0] cloud transmittance towards the sun, [1] eye adaptation target, [2] sky luminance
+  const sunVisBuf = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'sun visibility');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
-  const skyView = skyLUT.createView();
+  const skyView = skyLUT.createView({ dimension: '2d-array' });
 
   const bgTrans = bg(transPipe, [{ buffer: atmoUBO }, transView], 'trans');
   const bgMS = bg(msPipe, [{ buffer: atmoUBO }, transView, sampClamp, msView], 'ms');
-  const bgSkyView = bg(skyViewPipe, [{ buffer: frameUBO }, transView, msView, sampClamp, skyView], 'skyview');
+  const moonSkyViewPipe = await device.createComputePipelineAsync({
+    label: 'skyview moon', layout: 'auto',
+    compute: { module: await shader(SKYVIEW_LUT, 'skyview moon'), entryPoint: 'main', constants: { MOON: 1 } },
+  });
+  const [bgSkyView, bgMoonSkyView] = [skyViewPipe, moonSkyViewPipe].map((p, i) => bg(p, [{ buffer: frameUBO },
+    transView, msView, sampClamp, skyLUT.createView({ dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1 })], p.label));
   const bgEnv = bg(envPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, lvl(envTex, 0)], 'env');
   const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: sunVisBuf }], 'sunvis');
   const bgCubeMips = [];
@@ -1797,9 +2625,9 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
-    shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+  const [oceanMod, skyMod, birdMod, starMod, downMod, upMod, compMod] = await Promise.all([
+    shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BIRDS, 'birds'), shader(STARS, 'stars'),
+    shader(BLOOM_DOWN, 'bloom down'), shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -1820,6 +2648,41 @@ async function main() {
     depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
+  const add = { srcFactor: 'one', dstFactor: 'one', operation: 'add' };
+  const starPipe = await device.createRenderPipelineAsync({
+    label: 'stars', layout: 'auto',
+    vertex: {
+      module: starMod, entryPoint: 'vs',
+      buffers: [{ arrayStride: 32, stepMode: 'instance', attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' },
+        { shaderLocation: 1, offset: 16, format: 'float32x4' }] }],
+    },
+    fragment: { module: starMod, entryPoint: 'fs', targets: [{ format: HDR, blend: { color: add, alpha: add } }] },
+    primitive: { topology: 'triangle-list' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
+    multisample: { count: MSAA },
+  });
+  // birds: direct view, and the mirror image below sea level for the water's reflection
+  const [birdPipe, birdMirrorPipe] = await Promise.all([0, 1].map((mirror) => device.createRenderPipelineAsync({
+    label: mirror ? 'birds mirror' : 'birds', layout: 'auto',
+    vertex: {
+      module: birdMod, entryPoint: 'vs', constants: { MIRROR: mirror },
+      buffers: [
+        { arrayStride: 32, attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x3' },
+          { shaderLocation: 2, offset: 24, format: 'float32x2' }] },
+        { arrayStride: BIRD_FLOATS * 4, stepMode: 'instance', attributes: [
+          { shaderLocation: 3, offset: 0, format: 'float32x4' },
+          { shaderLocation: 4, offset: 16, format: 'float32x4' },
+          { shaderLocation: 5, offset: 32, format: 'float32x4' }] },
+      ],
+    },
+    fragment: { module: birdMod, entryPoint: 'fs', constants: { MIRROR: mirror }, targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  })));
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -1839,20 +2702,42 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
-    fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+  // Seagulls: CPU flock sim, one instanced draw (plus one into the reflection target)
+  const birds = createBirds(1);
+  const birdMesh = buildBirdMesh();
+  const birdVerts = birdMesh.length / 8;
+  const birdVB = mkBuf(birdMesh.byteLength, GU.VERTEX | GU.COPY_DST, 'bird mesh');
+  device.queue.writeBuffer(birdVB, 0, birdMesh);
+  const birdIB = mkBuf(MAX_BIRDS * BIRD_FLOATS * 4, GU.VERTEX | GU.COPY_DST, 'bird instances');
+  const birdSB = mkBuf(MAX_BIRDS * SHADOW_FLOATS * 4, GU.STORAGE | GU.COPY_DST, 'bird shadow casters');
+  let birdCount = 0;
+
+  // the ocean bind groups reference the screen-sized bird reflection target (see resize)
+  let bgOcean = [];
+  const makeOceanBGs = (birdReflView) => [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView,
+    skyView, sampClamp, fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView,
+    sampRepeat, fullArr(foamW[i]), { buffer: sunVisBuf }, birdReflView, { buffer: birdSB }], 'ocean' + i));
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+  const bgStars = bg(starPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'stars');
+  const starData = decodeStars(STAR_DATA, STAR_COUNT);
+  const starVB = mkBuf(starData.byteLength, GU.VERTEX | GU.COPY_DST, 'stars');
+  device.queue.writeBuffer(starVB, 0, starData);
+  const [bgBirds, bgBirdsMirror] = [birdPipe, birdMirrorPipe].map((p) => bg(p, [{ buffer: frameUBO }, transView,
+    skyView, sampClamp, envCubeView, { buffer: sunVisBuf }], p.label));
 
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
   const probePipe = await computePipe(HEIGHT_PROBE, 'height probe');
   const probeOut = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'probe out');
-  const probeRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'probe read');
+  // the same readback carries the eye adaptation target (sun visibility buffer, bytes 16..31)
+  const probeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'probe read');
   const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }], 'probe');
   let probePending = false, waterH = 0;
+  let adapt = 1, adaptTarget = 1;
   const onProbe = () => {
-    waterH = new Float32Array(probeRead.getMappedRange(0, 16))[0];
+    const r = new Float32Array(probeRead.getMappedRange(0, 32));
+    waterH = r[0];
+    adaptTarget = r[5];
     probeRead.unmap();
     probePending = false;
   };
@@ -1892,7 +2777,12 @@ async function main() {
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
   let W = 0, H = 0;
-  let colorMS, depthMS, hdrTex, bloomTex;
+  let colorMS, depthMS, hdrTex, bloomTex, mirColorMS, mirDepthMS, mirTex;
+  // mirror-image birds at half resolution (rgb premultiplied by coverage)
+  const mirrorPass = {
+    colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'discard' }],
+    depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
+  };
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
     depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
@@ -1911,7 +2801,7 @@ async function main() {
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
-    for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
+    for (const t of [colorMS, depthMS, hdrTex, bloomTex, mirColorMS, mirDepthMS, mirTex]) t && t.destroy();
     colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
@@ -1920,6 +2810,13 @@ async function main() {
     mainPass.colorAttachments[0].view = colorMS.createView();
     mainPass.colorAttachments[0].resolveTarget = hdrTex.createView();
     mainPass.depthStencilAttachment.view = depthMS.createView();
+    mirColorMS = device.createTexture({ size: [bw, bh], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    mirDepthMS = device.createTexture({ size: [bw, bh], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    mirTex = device.createTexture({ size: [bw, bh], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    mirrorPass.colorAttachments[0].view = mirColorMS.createView();
+    mirrorPass.colorAttachments[0].resolveTarget = mirTex.createView();
+    mirrorPass.depthStencilAttachment.view = mirDepthMS.createView();
+    bgOcean = makeOceanBGs(mirTex.createView());
     const hdrView = hdrTex.createView();
     const bv = [];
     for (let m = 0; m < BLOOM_LEVELS; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
@@ -1970,7 +2867,7 @@ async function main() {
   // Uniform data
   // --------------------------------------------------------------------------------------
   const simF = new Float32Array(56);
-  const frameF = new Float32Array(96);
+  const frameF = new Float32Array(108);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -2136,6 +3033,7 @@ async function main() {
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
     for (let c = 0; c < C; c++) { f[40 + c] = CASC_L[c]; f[48 + c] = 1 / CASC_L[c]; }
     f[56] = Math.cos(P.windDir * D2R); f[57] = Math.sin(P.windDir * D2R); f[58] = P.windSpeed;
+    f[60] = birdCount;
     f[64] = R0; f[65] = GRID; f[66] = FOAM_LEVEL_SIZE[0]; f[67] = FOAM_LEVEL_SIZE[1];
     f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
     f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
@@ -2148,6 +3046,10 @@ async function main() {
     f[90] = (33.1e-3 + 4.40e-3 * P.haze) * 1e-3;
     f[91] = 1.1e-4;
     f[92] = 1.5; f[93] = P.clouds; f[94] = 2.2; f[95] = time;
+    const north = P.sunAzim * D2R - sky.sunAz;   // scene azimuth of true north
+    f[96] = sky.lst; f[97] = sky.lat; f[98] = north; f[99] = adapt;
+    sceneDir(f, 100, sky.moonAz + north, sky.moonAlt); f[103] = sky.moonLux * LUX;
+    sceneDir(f, 104, sky.poleAz + north, sky.poleAlt); f[107] = sky.moonRadius;
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -2166,14 +3068,17 @@ async function main() {
     ['choppy', 'Choppiness', 0, 1.6, 0.01, 'spec'],
     ['turbidity', 'Water turbidity', 0.2, 3, 0.01, ''],
     ['foam', 'Foam', 0, 3, 0.01, ''],
-    ['sunElev', 'Sun elevation (deg)', -2, 60, 0.1, ''],
+    ['sunElev', 'Sun elevation (deg)', -18, 60, 0.1, ''],
     ['sunAzim', 'Sun azimuth (deg)', -180, 180, 0.5, ''],
     ['haze', 'Haze', 0.5, 15, 0.1, 'lut'],
     ['clouds', 'Low clouds', 0, 1, 0.01, ''],
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
+    ['birds', 'Seagulls', 0, MAX_BIRDS, 1, ''],
   ];
+  // URL overrides first, so the sliders start at them
+  for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');
     const name = document.createElement('span'); name.textContent = label;
@@ -2190,7 +3095,44 @@ async function main() {
     panel.appendChild(row);
   }
   if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
-  for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
+
+  // Location and date place the stars; the sun elevation slider picks the evening moment
+  let locKey = LOCATIONS[qs.get('loc')] ? qs.get('loc') : 'lajolla';
+  const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+  let dateStr = isDate(qs.get('date')) ? qs.get('date') : todayIn(LOCATIONS[locKey].tz);
+  let sky = null, skyElev = NaN, skyDirty = true;
+  const timeFmt = {};
+  for (const [k, l] of Object.entries(LOCATIONS)) {
+    timeFmt[k] = new Intl.DateTimeFormat('en-GB', { timeZone: l.tz, weekday: 'short', day: 'numeric',
+      month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  }
+  {
+    const locRow = document.createElement('label');
+    const locName = document.createElement('span'); locName.textContent = 'Location';
+    const sel = document.createElement('select');
+    for (const [k, l] of Object.entries(LOCATIONS)) sel.add(new Option(l.name, k, false, k === locKey));
+    sel.addEventListener('change', () => { locKey = sel.value; skyDirty = true; });
+    locRow.append(locName, sel, document.createElement('output'));
+    const dateRow = document.createElement('label');
+    const dateName = document.createElement('span'); dateName.textContent = 'Date';
+    const dateInp = document.createElement('input');
+    Object.assign(dateInp, { type: 'date', value: dateStr });
+    dateInp.addEventListener('change', () => { if (isDate(dateInp.value)) { dateStr = dateInp.value; skyDirty = true; } });
+    dateRow.append(dateName, dateInp, document.createElement('output'));
+    panel.prepend(locRow, dateRow);
+  }
+  const hudWhere = document.getElementById('where');
+  function updateSky() {
+    if (!skyDirty && P.sunElev === skyElev) return;
+    skyDirty = false; skyElev = P.sunElev;
+    sky = solveSky(LOCATIONS[locKey], dateStr, P.sunElev);
+    const moon = moonFor(sky.d, sky.lst, sky.lat);
+    const [poleAz, poleAlt] = altAz(ECLIPTIC_POLE[0], ECLIPTIC_POLE[1], sky.lst, sky.lat);
+    Object.assign(sky, { moonAz: moon.az, moonAlt: moon.alt, moonLux: moon.lux, moonRadius: moon.radius, poleAz, poleAlt });
+    const moonTxt = `moon ${Math.round(moon.illum * 100)}% ${moon.waxing ? 'waxing' : 'waning'}, ` +
+      (moon.alt > 0 ? `${Math.round(moon.alt / D2R)}° up` : 'below the horizon');
+    hudWhere.textContent = `${LOCATIONS[locKey].name}  ·  ${timeFmt[locKey].format(new Date(sky.utcMs))}  ·  ${moonTxt}`;
+  }
 
   const hudFps = document.getElementById('fps');
 
@@ -2275,7 +3217,16 @@ async function main() {
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
+    birds.update(dt, cam.x, cam.y, cam.z);
+    birdCount = Math.max(0, Math.min(MAX_BIRDS, Math.round(P.birds)));
+    if (birdCount) {
+      device.queue.writeBuffer(birdIB, 0, birds.inst, 0, birdCount * BIRD_FLOATS);
+      device.queue.writeBuffer(birdSB, 0, birds.shadow, 0, birdCount * SHADOW_FLOATS);
+    }
 
+    updateSky();
+    // eye adaptation eases towards the measured target (exactly 1 in daylight and at sunset)
+    if (adaptTarget > 0) adapt = Math.exp(Math.log(adapt) + (Math.log(adaptTarget) - Math.log(adapt)) * Math.min(1, dt * 3));
     writeFrame(simTime);
     writeSimStatic();
     simF[52] = simTime; simF[53] = dt;
@@ -2310,6 +3261,9 @@ async function main() {
     cp.setPipeline(skyViewPipe);
     cp.setBindGroup(0, bgSkyView);
     cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    cp.setPipeline(moonSkyViewPipe);
+    cp.setBindGroup(0, bgMoonSkyView);
+    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
     cp.setPipeline(sunVisPipe);
     cp.setBindGroup(0, bgSunVis);
     cp.dispatchWorkgroups(1);
@@ -2326,6 +3280,16 @@ async function main() {
     }
     cp.end();
 
+    const mp = enc.beginRenderPass(mirrorPass);
+    if (birdCount) {
+      mp.setPipeline(birdMirrorPipe);
+      mp.setBindGroup(0, bgBirdsMirror);
+      mp.setVertexBuffer(0, birdVB);
+      mp.setVertexBuffer(1, birdIB);
+      mp.draw(birdVerts, birdCount);
+    }
+    mp.end();
+
     const rp = enc.beginRenderPass(mainPass);
     if (nodeCount) {
       rp.setPipeline(oceanPipe);
@@ -2334,9 +3298,23 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    if (birdCount) {
+      rp.setPipeline(birdPipe);
+      rp.setBindGroup(0, bgBirds);
+      rp.setVertexBuffer(0, birdVB);
+      rp.setVertexBuffer(1, birdIB);
+      rp.draw(birdVerts, birdCount);
+    }
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
+    // stars are far below the sky's brightness while the sun is up
+    if (P.sunElev < 0.5) {
+      rp.setPipeline(starPipe);
+      rp.setBindGroup(0, bgStars);
+      rp.setVertexBuffer(0, starVB);
+      rp.draw(6, STAR_COUNT);
+    }
     rp.end();
 
     for (let m = 0; m < BLOOM_LEVELS; m++) {
@@ -2368,6 +3346,7 @@ async function main() {
     let doProbe = false;
     if (!probePending && (frameIndex & 7) === 0) {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
+      enc.copyBufferToBuffer(sunVisBuf, 0, probeRead, 16, 16);
       doProbe = true;
     }
     let doTs = false;

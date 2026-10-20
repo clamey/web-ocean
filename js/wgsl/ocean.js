@@ -2,10 +2,10 @@
 import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
 
-const RENDER_BINDINGS = /* wgsl */ `
+export const RENDER_BINDINGS = /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
-@group(0) @binding(2) var skyLUT: texture_2d<f32>;
+@group(0) @binding(2) var skyLUT: texture_2d_array<f32>;   // layer 0: sun, 1: moon
 @group(0) @binding(3) var sampC: sampler;
 `;
 
@@ -34,7 +34,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   let aa = vec2f(fwidth(el), fwidth(eh));
   var sunT = 1.0;
   let cl = cloudLayers(d2, pixAng, aa, &sunT);
-  let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
+  let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + (sunDisk(dir) + moonDisk(dir)) * sunT;
   return vec4f(L, 1.0);
 }
 `;
@@ -48,6 +48,9 @@ export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ 
 @group(0) @binding(9) var sampR: sampler;
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
 @group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
+@group(0) @binding(12) var birdRefl: texture_2d<f32>;
+// per bird: (camera-relative centre, projected half-span), (right axis, size), (forward axis, -)
+@group(0) @binding(13) var<storage, read> birdSh: array<vec4f>;
 ` + SKY_RENDER_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
@@ -106,6 +109,58 @@ fn lambdaSmith(w: vec3f, cov: vec3f) -> f32 {
   return (1.0 - 1.259 * a + 0.396 * a * a) / (3.535 * a + 2.181 * a * a);
 }
 
+// Soft seagull shadows. Each bird is a wing box and a body box in its own plane; the sun ray
+// from the shaded point is intersected with that plane and the coverage of the solar disc
+// (whose footprint grows with distance: the penumbra) is estimated separably. A low sun puts
+// the birds so far from their shadows that the penumbra swallows them, as in reality.
+fn boxCov(x: f32, a0: f32, a1: f32, w: f32) -> f32 {
+  return clamp((min(a1, x + w) - max(a0, x - w)) / (2.0 * w), 0.0, 1.0);
+}
+fn birdShadow(p: vec3f, Ld: vec3f) -> f32 {
+  var lit = 1.0;
+  let nb = u32(F.windP[1].x);
+  for (var i = 0u; i < nb; i++) {
+    let b0 = birdSh[i * 3u];
+    let q = b0.xyz - p;
+    let t = dot(q, Ld);
+    let reach = b0.w + 0.45 + t * SUN_ANG_R;
+    if (t > 0.0 && dot(q, q) - t * t < reach * reach) {
+      let b1 = birdSh[i * 3u + 1u];
+      let r = b1.xyz;
+      let f = birdSh[i * 3u + 2u].xyz;
+      let u = cross(r, f);
+      let du = dot(Ld, u);
+      let su = select(-1.0, 1.0, du >= 0.0) * max(abs(du), 0.05);
+      let th = dot(q, u) / su;
+      let x = Ld * th - q;
+      let lx = dot(x, r);
+      let lz = dot(x, f);
+      let w = max(th * SUN_ANG_R, 0.02);
+      let s = b1.w;
+      let wing = boxCov(lx, -b0.w, b0.w, w) * boxCov(lz, -0.16 * s, 0.07 * s, w);
+      let body = boxCov(lx, -0.065 * s, 0.065 * s, w) * boxCov(lz, -0.38 * s, 0.36 * s, w);
+      lit *= 1.0 - max(wing, body);
+    }
+  }
+  return lit;
+}
+
+// specular reflection of a distant light (sun or moon) per unit illuminance: anisotropic
+// Gaussian slope distribution with Smith masking
+fn glint(V: vec3f, Ld: vec3f, sl: vec2f, cov: vec3f) -> f32 {
+  let Hv = normalize(V + Ld);
+  let hs = -Hv.xz / max(Hv.y, 1e-3);
+  let dsl = hs - sl;
+  let det = max(cov.x * cov.y - cov.z * cov.z, 1e-10);
+  let e = (dsl.x * dsl.x * cov.y + dsl.y * dsl.y * cov.x - 2.0 * dsl.x * dsl.y * cov.z) / det;
+  let pdf = exp(-0.5 * e) / (2.0 * PI * sqrt(det));
+  let hy2 = Hv.y * Hv.y;
+  let Dm = pdf / max(hy2 * hy2, 1e-6);
+  let G = 1.0 / (1.0 + lambdaSmith(V, cov) + lambdaSmith(Ld, cov));
+  let Fh = fresnelWater(dot(V, Hv));
+  return (Fh * Dm * G / (4.0 * max(V.y, 0.02))) * step(0.0, Ld.y);
+}
+
 fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let a = textureSample(foamTex, sampR, xz * 0.23 + vec2f(0.013, 0.0) * t).r;
   let b = textureSample(foamTex, sampR, xz * 0.71 + vec2f(0.37, 0.71)).g;
@@ -154,7 +209,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
-  let sunE = sunIlluminance() * sunVis[0];
+  let sunE = sunIlluminance() * sunVis[0] * select(1.0, birdShadow(in.rel, Ld), Ld.y > 0.0);
   let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
   // average radiance of the whole upper hemisphere (incl. the bright horizon band)
   let skyHemi = skyUp * 0.4 + 0.15 * (
@@ -165,17 +220,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let skyN = textureSampleLevel(envCube, sampC, nrm, ENV_MAXMIP - 1.0).rgb;
 
   // ---- sun glitter: anisotropic Gaussian slope distribution ----
-  let Hv = normalize(V + Ld);
-  let hs = -Hv.xz / max(Hv.y, 1e-3);
-  let dsl = hs - sl;
-  let det = max(cov.x * cov.y - cov.z * cov.z, 1e-10);
-  let e = (dsl.x * dsl.x * cov.y + dsl.y * dsl.y * cov.x - 2.0 * dsl.x * dsl.y * cov.z) / det;
-  let pdf = exp(-0.5 * e) / (2.0 * PI * sqrt(det));
-  let hy2 = Hv.y * Hv.y;
-  let Dm = pdf / max(hy2 * hy2, 1e-6);
-  let G = 1.0 / (1.0 + lambdaSmith(V, cov) + lambdaSmith(Ld, cov));
-  let Fh = fresnelWater(dot(V, Hv));
-  let spec = sunE * (Fh * Dm * G / (4.0 * max(V.y, 0.02))) * step(0.0, Ld.y);
+  // the moon lays its own glitter path
+  let Lm = F.moonDir.xyz;
+  let moonE = moonIlluminance();
+  let spec = sunE * glint(V, Ld, sl, cov) + moonE * glint(V, Lm, sl, cov);
 
   // ---- sky reflection ----
   // At grazing angles the *visible* facets are biased towards the viewer (projected-area
@@ -190,7 +238,28 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   R.y = abs(R.y) * 0.4 + max(R.y, 0.0) * 0.6;
   R = normalize(R);
   let envLod = clamp(log2(max(2.0 * sig * ENV_TEXELS_PER_RAD, 1.0)), 0.0, ENV_MAXMIP);
-  let refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  var refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  // seagull reflections: the mirror-image bird render, looked up along the reflection ray
+  // (continued 40 m past the surface into the mirror world; flat water maps straight back to
+  // this pixel). Resolved waves displace the lookup; like the sky reflection, the unresolved
+  // slope spread along the view blurs it into a vertical streak instead of sparkling specks.
+  let Rb = reflect(-V, nrm);
+  let Rm = vec3f(Rb.x, -Rb.y, Rb.z) * 40.0;
+  let spread = vec3f(0.0, 2.0 * sigV * 40.0, 0.0);
+  let ca = F.viewProj * vec4f(in.rel + Rm + spread, 1.0);
+  let cb = F.viewProj * vec4f(in.rel + Rm - spread, 1.0);
+  var bRefl = vec4f(0.0);
+  if (ca.w > 0.0 && cb.w > 0.0) {
+    let ua = ca.xy / ca.w * vec2f(0.5, -0.5) + 0.5;
+    let ub = cb.xy / cb.w * vec2f(0.5, -0.5) + 0.5;
+    for (var k = 0; k < 5; k++) {
+      let uv = mix(ua, ub, f32(k) * 0.25);
+      let wk = 3.0 - abs(f32(k) - 2.0);
+      if (all(uv > vec2f(0.0)) && all(uv < vec2f(1.0))) { bRefl += textureSampleLevel(birdRefl, sampC, uv, 0.0) * wk; }
+    }
+    bRefl /= 9.0;
+    refl = refl * (1.0 - bRefl.a) + bRefl.rgb;
+  }
   let NdV = max(dot(nV, V), 0.0);
   // Fresnel from a partially smoothed normal: the long-wave facet plus the grazing-angle
   // statistics of everything finer (visible facets at grazing incidence stay highly reflective)
@@ -201,7 +270,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let ambient = skyUp * 1.3 + skyN * 0.5;
   let NdL = max(dot(nrm, Ld), 0.0);
   // upwelling light is diffuse: light it with smooth terms only (no per-pixel normal noise)
-  var body = F.waterCol.rgb * (skyHemi * 1.6 + sunE * max(Ld.y, 0.0) * 0.8);
+  var body = F.waterCol.rgb * (skyHemi * 1.6 + sunE * max(Ld.y, 0.0) * 0.8 + moonE * max(Lm.y, 0.0) * 0.8);
   // light transmitted through the thin upper part of backlit crests
   let crest = clamp((in.height - 0.05) / 0.9, 0.0, 1.0);
   let toSun = max(dot(Ld, -V), 0.0);
@@ -247,7 +316,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let foamAmb = skyHemi * 1.0 + skyN * 0.3;
   let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
   // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
-  let foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
+  let foamLit = foamAlb * ((sunE * max(dot(nrm, Ld), 0.0) + moonE * max(dot(nrm, Lm), 0.0)) * 0.318 * 0.5 + foamAmbN * 1.55);
 
   if (F.post.w > 0.5) {
     // debug: r = foam cover, g = clamp(J), b = world foam level-0 weight
@@ -257,9 +326,11 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     if (F.post.w > 4.5 && F.post.w < 5.5) { return vec4f(body * (1.0 - Fr), 1.0); }
     if (F.post.w > 5.5 && F.post.w < 6.5) { return vec4f(foamLit, 1.0); }
     if (F.post.w > 6.5 && F.post.w < 7.5) { return vec4f(skyUp, 1.0); }
+    if (F.post.w > 7.5 && F.post.w < 8.5) { return vec4f(bRefl.rgb + vec3f(bRefl.a * 0.3), 1.0); }
     return vec4f(fwl.r, fwl.g, fresh, 1.0) * 0.2;
   }
-  var col = body * (1.0 - Fr) + refl * Fr + spec;
+  // a reflected bird also hides the sun glitter behind it (dark gulls in the sun path)
+  var col = body * (1.0 - Fr) + refl * Fr + spec * (1.0 - bRefl.a);
   col = mix(col, foamLit, foamMask * 0.95);
 
   // ---- aerial perspective ----

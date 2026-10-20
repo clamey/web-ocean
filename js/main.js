@@ -6,7 +6,12 @@ import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js'
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
+import { BIRDS } from './wgsl/birds.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
+import { STARS } from './wgsl/stars.js';
+import { MAX_BIRDS, BIRD_FLOATS, SHADOW_FLOATS, buildBirdMesh, createBirds } from './birds.js';
+import { LOCATIONS, todayIn, solveSky, decodeStars, moonFor, altAz, ECLIPTIC_POLE } from './astro.js';
+import { STAR_COUNT, STAR_DATA } from './stars.js';
 
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
@@ -35,6 +40,7 @@ export const P = {
   clouds: 0.40,
   veil: 0.36,
   bloom: 0.10,
+  birds: 24,           // seagull count
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -61,6 +67,13 @@ function mat4Mul(out, a, b) {
     out[c * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
     out[c * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
   }
+}
+
+// renderer units per lux (solar illuminance above the atmosphere, 1.28e5 lux, is 14)
+const LUX = 14 / 1.28e5;
+// scene direction for a true azimuth (already turned by the compass offset) and altitude
+function sceneDir(out, o, az, alt) {
+  out[o] = Math.sin(az) * Math.cos(alt); out[o + 1] = Math.sin(alt); out[o + 2] = -Math.cos(az) * Math.cos(alt);
 }
 
 async function main() {
@@ -133,7 +146,7 @@ async function main() {
     computePipe(RGBA8_MIPS, 'rgba8 mips'),
     computePipe(TRANS_LUT, 'transmittance'),
     computePipe(MS_LUT, 'multiscatter'),
-    computePipe(SKYVIEW_LUT, 'skyview'),
+    computePipe(SKYVIEW_LUT, 'skyview sun'),
     computePipe(ENV_CUBE, 'env cube'),
     computePipe(CUBE_MIPS, 'cube mips'),
     computePipe(FOAM_UPDATE, 'foam update'),
@@ -212,7 +225,10 @@ async function main() {
   });
   const transLUT = mkLut(256, 64, 'transmittance');
   const msLUT = mkLut(32, 32, 'multiscatter');
-  const skyLUT = mkLut(SKY_W, SKY_H, 'skyview');
+  // sky-view LUT layers: 0 = sunlit sky, 1 = moonlit sky
+  const skyLUT = device.createTexture({
+    label: 'skyview', size: [SKY_W, SKY_H, 2], format: 'rgba16float', usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
+  });
   const envTex = device.createTexture({
     label: 'env cube', size: [ENV_SIZE, ENV_SIZE, 6], format: 'rgba16float', mipLevelCount: ENV_MIPS,
     usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
@@ -226,15 +242,21 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
-  const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
-  const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
+  const frameUBO = mkBuf(432, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  // [0] cloud transmittance towards the sun, [1] eye adaptation target, [2] sky luminance
+  const sunVisBuf = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'sun visibility');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
-  const skyView = skyLUT.createView();
+  const skyView = skyLUT.createView({ dimension: '2d-array' });
 
   const bgTrans = bg(transPipe, [{ buffer: atmoUBO }, transView], 'trans');
   const bgMS = bg(msPipe, [{ buffer: atmoUBO }, transView, sampClamp, msView], 'ms');
-  const bgSkyView = bg(skyViewPipe, [{ buffer: frameUBO }, transView, msView, sampClamp, skyView], 'skyview');
+  const moonSkyViewPipe = await device.createComputePipelineAsync({
+    label: 'skyview moon', layout: 'auto',
+    compute: { module: await shader(SKYVIEW_LUT, 'skyview moon'), entryPoint: 'main', constants: { MOON: 1 } },
+  });
+  const [bgSkyView, bgMoonSkyView] = [skyViewPipe, moonSkyViewPipe].map((p, i) => bg(p, [{ buffer: frameUBO },
+    transView, msView, sampClamp, skyLUT.createView({ dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1 })], p.label));
   const bgEnv = bg(envPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, lvl(envTex, 0)], 'env');
   const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: sunVisBuf }], 'sunvis');
   const bgCubeMips = [];
@@ -245,9 +267,9 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
-    shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+  const [oceanMod, skyMod, birdMod, starMod, downMod, upMod, compMod] = await Promise.all([
+    shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BIRDS, 'birds'), shader(STARS, 'stars'),
+    shader(BLOOM_DOWN, 'bloom down'), shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
   ]);
   const oceanPipe = await device.createRenderPipelineAsync({
     label: 'ocean', layout: 'auto',
@@ -268,6 +290,41 @@ async function main() {
     depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
+  const add = { srcFactor: 'one', dstFactor: 'one', operation: 'add' };
+  const starPipe = await device.createRenderPipelineAsync({
+    label: 'stars', layout: 'auto',
+    vertex: {
+      module: starMod, entryPoint: 'vs',
+      buffers: [{ arrayStride: 32, stepMode: 'instance', attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' },
+        { shaderLocation: 1, offset: 16, format: 'float32x4' }] }],
+    },
+    fragment: { module: starMod, entryPoint: 'fs', targets: [{ format: HDR, blend: { color: add, alpha: add } }] },
+    primitive: { topology: 'triangle-list' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
+    multisample: { count: MSAA },
+  });
+  // birds: direct view, and the mirror image below sea level for the water's reflection
+  const [birdPipe, birdMirrorPipe] = await Promise.all([0, 1].map((mirror) => device.createRenderPipelineAsync({
+    label: mirror ? 'birds mirror' : 'birds', layout: 'auto',
+    vertex: {
+      module: birdMod, entryPoint: 'vs', constants: { MIRROR: mirror },
+      buffers: [
+        { arrayStride: 32, attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x3' },
+          { shaderLocation: 2, offset: 24, format: 'float32x2' }] },
+        { arrayStride: BIRD_FLOATS * 4, stepMode: 'instance', attributes: [
+          { shaderLocation: 3, offset: 0, format: 'float32x4' },
+          { shaderLocation: 4, offset: 16, format: 'float32x4' },
+          { shaderLocation: 5, offset: 32, format: 'float32x4' }] },
+      ],
+    },
+    fragment: { module: birdMod, entryPoint: 'fs', constants: { MIRROR: mirror }, targets: [{ format: HDR }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    multisample: { count: MSAA },
+  })));
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -287,20 +344,42 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
-    fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+  // Seagulls: CPU flock sim, one instanced draw (plus one into the reflection target)
+  const birds = createBirds(1);
+  const birdMesh = buildBirdMesh();
+  const birdVerts = birdMesh.length / 8;
+  const birdVB = mkBuf(birdMesh.byteLength, GU.VERTEX | GU.COPY_DST, 'bird mesh');
+  device.queue.writeBuffer(birdVB, 0, birdMesh);
+  const birdIB = mkBuf(MAX_BIRDS * BIRD_FLOATS * 4, GU.VERTEX | GU.COPY_DST, 'bird instances');
+  const birdSB = mkBuf(MAX_BIRDS * SHADOW_FLOATS * 4, GU.STORAGE | GU.COPY_DST, 'bird shadow casters');
+  let birdCount = 0;
+
+  // the ocean bind groups reference the screen-sized bird reflection target (see resize)
+  let bgOcean = [];
+  const makeOceanBGs = (birdReflView) => [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView,
+    skyView, sampClamp, fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView,
+    sampRepeat, fullArr(foamW[i]), { buffer: sunVisBuf }, birdReflView, { buffer: birdSB }], 'ocean' + i));
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+  const bgStars = bg(starPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'stars');
+  const starData = decodeStars(STAR_DATA, STAR_COUNT);
+  const starVB = mkBuf(starData.byteLength, GU.VERTEX | GU.COPY_DST, 'stars');
+  device.queue.writeBuffer(starVB, 0, starData);
+  const [bgBirds, bgBirdsMirror] = [birdPipe, birdMirrorPipe].map((p) => bg(p, [{ buffer: frameUBO }, transView,
+    skyView, sampClamp, envCubeView, { buffer: sunVisBuf }], p.label));
 
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
   const probePipe = await computePipe(HEIGHT_PROBE, 'height probe');
   const probeOut = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'probe out');
-  const probeRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'probe read');
+  // the same readback carries the eye adaptation target (sun visibility buffer, bytes 16..31)
+  const probeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'probe read');
   const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }], 'probe');
   let probePending = false, waterH = 0;
+  let adapt = 1, adaptTarget = 1;
   const onProbe = () => {
-    waterH = new Float32Array(probeRead.getMappedRange(0, 16))[0];
+    const r = new Float32Array(probeRead.getMappedRange(0, 32));
+    waterH = r[0];
+    adaptTarget = r[5];
     probeRead.unmap();
     probePending = false;
   };
@@ -340,7 +419,12 @@ async function main() {
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
   let W = 0, H = 0;
-  let colorMS, depthMS, hdrTex, bloomTex;
+  let colorMS, depthMS, hdrTex, bloomTex, mirColorMS, mirDepthMS, mirTex;
+  // mirror-image birds at half resolution (rgb premultiplied by coverage)
+  const mirrorPass = {
+    colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'discard' }],
+    depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
+  };
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
     depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
@@ -359,7 +443,7 @@ async function main() {
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
-    for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
+    for (const t of [colorMS, depthMS, hdrTex, bloomTex, mirColorMS, mirDepthMS, mirTex]) t && t.destroy();
     colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
@@ -368,6 +452,13 @@ async function main() {
     mainPass.colorAttachments[0].view = colorMS.createView();
     mainPass.colorAttachments[0].resolveTarget = hdrTex.createView();
     mainPass.depthStencilAttachment.view = depthMS.createView();
+    mirColorMS = device.createTexture({ size: [bw, bh], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    mirDepthMS = device.createTexture({ size: [bw, bh], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    mirTex = device.createTexture({ size: [bw, bh], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    mirrorPass.colorAttachments[0].view = mirColorMS.createView();
+    mirrorPass.colorAttachments[0].resolveTarget = mirTex.createView();
+    mirrorPass.depthStencilAttachment.view = mirDepthMS.createView();
+    bgOcean = makeOceanBGs(mirTex.createView());
     const hdrView = hdrTex.createView();
     const bv = [];
     for (let m = 0; m < BLOOM_LEVELS; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
@@ -418,7 +509,7 @@ async function main() {
   // Uniform data
   // --------------------------------------------------------------------------------------
   const simF = new Float32Array(56);
-  const frameF = new Float32Array(96);
+  const frameF = new Float32Array(108);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -584,6 +675,7 @@ async function main() {
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
     for (let c = 0; c < C; c++) { f[40 + c] = CASC_L[c]; f[48 + c] = 1 / CASC_L[c]; }
     f[56] = Math.cos(P.windDir * D2R); f[57] = Math.sin(P.windDir * D2R); f[58] = P.windSpeed;
+    f[60] = birdCount;
     f[64] = R0; f[65] = GRID; f[66] = FOAM_LEVEL_SIZE[0]; f[67] = FOAM_LEVEL_SIZE[1];
     f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
     f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
@@ -596,6 +688,10 @@ async function main() {
     f[90] = (33.1e-3 + 4.40e-3 * P.haze) * 1e-3;
     f[91] = 1.1e-4;
     f[92] = 1.5; f[93] = P.clouds; f[94] = 2.2; f[95] = time;
+    const north = P.sunAzim * D2R - sky.sunAz;   // scene azimuth of true north
+    f[96] = sky.lst; f[97] = sky.lat; f[98] = north; f[99] = adapt;
+    sceneDir(f, 100, sky.moonAz + north, sky.moonAlt); f[103] = sky.moonLux * LUX;
+    sceneDir(f, 104, sky.poleAz + north, sky.poleAlt); f[107] = sky.moonRadius;
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -614,14 +710,17 @@ async function main() {
     ['choppy', 'Choppiness', 0, 1.6, 0.01, 'spec'],
     ['turbidity', 'Water turbidity', 0.2, 3, 0.01, ''],
     ['foam', 'Foam', 0, 3, 0.01, ''],
-    ['sunElev', 'Sun elevation (deg)', -2, 60, 0.1, ''],
+    ['sunElev', 'Sun elevation (deg)', -18, 60, 0.1, ''],
     ['sunAzim', 'Sun azimuth (deg)', -180, 180, 0.5, ''],
     ['haze', 'Haze', 0.5, 15, 0.1, 'lut'],
     ['clouds', 'Low clouds', 0, 1, 0.01, ''],
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
+    ['birds', 'Seagulls', 0, MAX_BIRDS, 1, ''],
   ];
+  // URL overrides first, so the sliders start at them
+  for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');
     const name = document.createElement('span'); name.textContent = label;
@@ -638,7 +737,44 @@ async function main() {
     panel.appendChild(row);
   }
   if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
-  for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
+
+  // Location and date place the stars; the sun elevation slider picks the evening moment
+  let locKey = LOCATIONS[qs.get('loc')] ? qs.get('loc') : 'lajolla';
+  const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+  let dateStr = isDate(qs.get('date')) ? qs.get('date') : todayIn(LOCATIONS[locKey].tz);
+  let sky = null, skyElev = NaN, skyDirty = true;
+  const timeFmt = {};
+  for (const [k, l] of Object.entries(LOCATIONS)) {
+    timeFmt[k] = new Intl.DateTimeFormat('en-GB', { timeZone: l.tz, weekday: 'short', day: 'numeric',
+      month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  }
+  {
+    const locRow = document.createElement('label');
+    const locName = document.createElement('span'); locName.textContent = 'Location';
+    const sel = document.createElement('select');
+    for (const [k, l] of Object.entries(LOCATIONS)) sel.add(new Option(l.name, k, false, k === locKey));
+    sel.addEventListener('change', () => { locKey = sel.value; skyDirty = true; });
+    locRow.append(locName, sel, document.createElement('output'));
+    const dateRow = document.createElement('label');
+    const dateName = document.createElement('span'); dateName.textContent = 'Date';
+    const dateInp = document.createElement('input');
+    Object.assign(dateInp, { type: 'date', value: dateStr });
+    dateInp.addEventListener('change', () => { if (isDate(dateInp.value)) { dateStr = dateInp.value; skyDirty = true; } });
+    dateRow.append(dateName, dateInp, document.createElement('output'));
+    panel.prepend(locRow, dateRow);
+  }
+  const hudWhere = document.getElementById('where');
+  function updateSky() {
+    if (!skyDirty && P.sunElev === skyElev) return;
+    skyDirty = false; skyElev = P.sunElev;
+    sky = solveSky(LOCATIONS[locKey], dateStr, P.sunElev);
+    const moon = moonFor(sky.d, sky.lst, sky.lat);
+    const [poleAz, poleAlt] = altAz(ECLIPTIC_POLE[0], ECLIPTIC_POLE[1], sky.lst, sky.lat);
+    Object.assign(sky, { moonAz: moon.az, moonAlt: moon.alt, moonLux: moon.lux, moonRadius: moon.radius, poleAz, poleAlt });
+    const moonTxt = `moon ${Math.round(moon.illum * 100)}% ${moon.waxing ? 'waxing' : 'waning'}, ` +
+      (moon.alt > 0 ? `${Math.round(moon.alt / D2R)}° up` : 'below the horizon');
+    hudWhere.textContent = `${LOCATIONS[locKey].name}  ·  ${timeFmt[locKey].format(new Date(sky.utcMs))}  ·  ${moonTxt}`;
+  }
 
   const hudFps = document.getElementById('fps');
 
@@ -723,7 +859,16 @@ async function main() {
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
+    birds.update(dt, cam.x, cam.y, cam.z);
+    birdCount = Math.max(0, Math.min(MAX_BIRDS, Math.round(P.birds)));
+    if (birdCount) {
+      device.queue.writeBuffer(birdIB, 0, birds.inst, 0, birdCount * BIRD_FLOATS);
+      device.queue.writeBuffer(birdSB, 0, birds.shadow, 0, birdCount * SHADOW_FLOATS);
+    }
 
+    updateSky();
+    // eye adaptation eases towards the measured target (exactly 1 in daylight and at sunset)
+    if (adaptTarget > 0) adapt = Math.exp(Math.log(adapt) + (Math.log(adaptTarget) - Math.log(adapt)) * Math.min(1, dt * 3));
     writeFrame(simTime);
     writeSimStatic();
     simF[52] = simTime; simF[53] = dt;
@@ -758,6 +903,9 @@ async function main() {
     cp.setPipeline(skyViewPipe);
     cp.setBindGroup(0, bgSkyView);
     cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    cp.setPipeline(moonSkyViewPipe);
+    cp.setBindGroup(0, bgMoonSkyView);
+    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
     cp.setPipeline(sunVisPipe);
     cp.setBindGroup(0, bgSunVis);
     cp.dispatchWorkgroups(1);
@@ -774,6 +922,16 @@ async function main() {
     }
     cp.end();
 
+    const mp = enc.beginRenderPass(mirrorPass);
+    if (birdCount) {
+      mp.setPipeline(birdMirrorPipe);
+      mp.setBindGroup(0, bgBirdsMirror);
+      mp.setVertexBuffer(0, birdVB);
+      mp.setVertexBuffer(1, birdIB);
+      mp.draw(birdVerts, birdCount);
+    }
+    mp.end();
+
     const rp = enc.beginRenderPass(mainPass);
     if (nodeCount) {
       rp.setPipeline(oceanPipe);
@@ -782,9 +940,23 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    if (birdCount) {
+      rp.setPipeline(birdPipe);
+      rp.setBindGroup(0, bgBirds);
+      rp.setVertexBuffer(0, birdVB);
+      rp.setVertexBuffer(1, birdIB);
+      rp.draw(birdVerts, birdCount);
+    }
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
+    // stars are far below the sky's brightness while the sun is up
+    if (P.sunElev < 0.5) {
+      rp.setPipeline(starPipe);
+      rp.setBindGroup(0, bgStars);
+      rp.setVertexBuffer(0, starVB);
+      rp.draw(6, STAR_COUNT);
+    }
     rp.end();
 
     for (let m = 0; m < BLOOM_LEVELS; m++) {
@@ -816,6 +988,7 @@ async function main() {
     let doProbe = false;
     if (!probePending && (frameIndex & 7) === 0) {
       enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
+      enc.copyBufferToBuffer(sunVisBuf, 0, probeRead, 16, 16);
       doProbe = true;
     }
     let doTs = false;
