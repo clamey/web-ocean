@@ -10,7 +10,7 @@ import { BIRDS } from './wgsl/birds.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 import { STARS } from './wgsl/stars.js';
 import { MAX_BIRDS, BIRD_FLOATS, SHADOW_FLOATS, buildBirdMesh, createBirds } from './birds.js';
-import { LOCATIONS, todayIn, solveSky, decodeStars, moonFor, altAz, ECLIPTIC_POLE } from './astro.js';
+import { LOCATIONS, todayIn, solveSky, sunElevAt, decodeStars, moonFor, altAz, ECLIPTIC_POLE } from './astro.js';
 import { STAR_COUNT, STAR_DATA } from './stars.js';
 
 const qs = new URLSearchParams(location.search);
@@ -35,6 +35,7 @@ export const P = {
   foam: 1.0,
   sunElev: 2.6,        // deg
   sunAzim: 4,          // deg (0 = straight ahead of the start view)
+  timelapse: 0,        // x real time the clock runs at (0 = off); the sun sets at its true rate
   exposure: 1.35,
   haze: 3.0,
   clouds: 0.40,
@@ -712,6 +713,7 @@ async function main() {
     ['foam', 'Foam', 0, 3, 0.01, ''],
     ['sunElev', 'Sun elevation (deg)', -18, 60, 0.1, ''],
     ['sunAzim', 'Sun azimuth (deg)', -180, 180, 0.5, ''],
+    ['timelapse', 'Timelapse (x real time)', 0, 600, 10, ''],
     ['haze', 'Haze', 0.5, 15, 0.1, 'lut'],
     ['clouds', 'Low clouds', 0, 1, 0.01, ''],
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
@@ -721,6 +723,7 @@ async function main() {
   ];
   // URL overrides first, so the sliders start at them
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
+  const sliderEls = {};
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');
     const name = document.createElement('span'); name.textContent = label;
@@ -735,6 +738,7 @@ async function main() {
     });
     row.append(name, inp, val);
     panel.appendChild(row);
+    sliderEls[key] = { inp, val };
   }
   if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
 
@@ -774,6 +778,22 @@ async function main() {
     const moonTxt = `moon ${Math.round(moon.illum * 100)}% ${moon.waxing ? 'waxing' : 'waning'}, ` +
       (moon.alt > 0 ? `${Math.round(moon.alt / D2R)}° up` : 'below the horizon');
     hudWhere.textContent = `${LOCATIONS[locKey].name}  ·  ${timeFmt[locKey].format(new Date(sky.utcMs))}  ·  ${moonTxt}`;
+  }
+
+  // Timelapse: run the clock forward from the current moment at P.timelapse x real time and
+  // drive the sun elevation from the real solar position, so the sun sets at its true rate
+  // for the location and date. Stops at astronomical night (the slider's lower end).
+  let tlD = NaN, tlElev = NaN, tlKey = '';
+  const sunSlider = sliderEls.sunElev;
+  function advanceTimelapse(dt) {
+    if (!(P.timelapse > 0) || P.sunElev <= -18) return;
+    const key = locKey + dateStr;
+    // (re)start after the sun slider, location or date was changed by hand
+    if (P.sunElev !== tlElev || key !== tlKey) { updateSky(); tlD = sky.d; tlKey = key; }
+    tlD += dt * P.timelapse / 86400;
+    tlElev = P.sunElev = Math.max(-18, sunElevAt(LOCATIONS[locKey], tlD));
+    sunSlider.inp.value = tlElev; sunSlider.val.textContent = tlElev.toFixed(1);
+    envFull = Math.max(envFull, 1);   // all six reflection cube faces follow the moving sun
   }
 
   const hudFps = document.getElementById('fps');
@@ -866,6 +886,7 @@ async function main() {
       device.queue.writeBuffer(birdSB, 0, birds.shadow, 0, birdCount * SHADOW_FLOATS);
     }
 
+    advanceTimelapse(dt);
     updateSky();
     // eye adaptation eases towards the measured target (exactly 1 in daylight and at sunset)
     if (adaptTarget > 0) adapt = Math.exp(Math.log(adapt) + (Math.log(adaptTarget) - Math.log(adapt)) * Math.min(1, dt * 3));

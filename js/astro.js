@@ -48,6 +48,12 @@ export function solveSky(loc, dateStr, elevDeg) {
   return { d, lst: wrapAngle(lst), lat, sunAz, utcMs: J2000_MS + d * 864e5 };
 }
 
+// the sun's elevation (deg) seen from loc at d days since J2000.0
+export function sunElevAt(loc, d) {
+  const [ra, dec] = sunRaDec(d);
+  return altAz(ra, dec, gmst(d) + loc.lon * DEG, loc.lat * DEG)[1] / DEG;
+}
+
 // equatorial (rad) -> [azimuth from north through east, altitude] for sidereal time lst
 export function altAz(ra, dec, lst, lat) {
   const ha = lst - ra;
