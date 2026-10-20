@@ -129,7 +129,7 @@ Written by Maksymilian Dendura, the author of [Noniv/web-ocean](https://github.c
 
 ### This fork
 
-The seagulls, stars, Moon, night sky, and eye adaptation were added on top of the original code by [clamey](https://github.com/clamey).
+The seagulls, stars, Moon, night sky, and eye adaptation were added on top of the original code by [clamey](https://github.com/clamey) with Claude Code (Opus 5.5).
 
 ## Repository layout
 
