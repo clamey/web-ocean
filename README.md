@@ -1,6 +1,15 @@
 # web-ocean
 
-A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, a physically based sky with clouds, and flocks of seagulls. You fly around it with a free camera.
+> **This is a fork of [Noniv/web-ocean](https://github.com/Noniv/web-ocean) by Maksymilian Dendura.** The ocean simulation, sky, clouds, renderer, and build tooling are all their original work. This fork adds seagulls, a real star catalogue, the Moon, and night lighting on top of it. If you like this, please star and follow [the original project](https://github.com/Noniv/web-ocean).
+
+A real-time open-sea scene written from scratch on WebGPU, with no engine or rendering library, covering everything from sunset to full night. You fly around it with a free camera.
+
+**Live demo: https://clamey.github.io/web-ocean/** (needs a WebGPU browser)
+
+- **Sea:** FFT-simulated waves from kilometre swells down to millimetre ripples, whitecaps and drifting foam, sun and moon glitter, and sky reflections.
+- **Sky:** a physically based atmosphere with two cloud layers, the Earth's shadow after sunset, and eye adaptation as it gets dark.
+- **Seagulls:** flocks of seagulls with articulated wings, soft shadows, and reflections on the water.
+- **Real night sky:** the 5,080 naked-eye stars, and a Moon with the correct position, phase, and orientation for a real place and date (La Jolla, Santorini, Split, or Key West). The Moon also lights the sea.
 
 ![Looking toward the sun from 2.4 m above the water](docs/front.jpg)
 
@@ -12,7 +21,9 @@ A real-time ocean renderer written from scratch on WebGPU, with no engine or ren
 
 You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (124 KB instead of 187 KB, 40 KB of which is the star catalogue). Both are self-contained and work from `file://`.
+The easiest way is the [live demo](https://clamey.github.io/web-ocean/). It is served from `main` by GitHub Pages, and the single-file bundles are at [`/ocean.html`](https://clamey.github.io/web-ocean/ocean.html) and [`/ocean.min.html`](https://clamey.github.io/web-ocean/ocean.min.html).
+
+To run it locally, open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (124 KB instead of 187 KB, 40 KB of which is the star catalogue). Both are self-contained and work from `file://`.
 
 To run from source:
 
@@ -110,7 +121,15 @@ The per-frame code reuses preallocated typed arrays and descriptors, so the garb
 
 ## How it was made
 
-I built this with Claude Code (Opus 5.5). I asked for the most realistic water it could produce, in WebGPU, with a floating camera, and left the architecture and implementation to it. It checked its own work by rendering screenshots in headless Chrome and having separate critic subagents review them, so it was not grading its own output. I gave feedback along the way, mainly on the clouds, which led to replacing the volumetric clouds with the flat layers and later fixing their edge aliasing.
+### The original project
+
+Written by Maksymilian Dendura, the author of [Noniv/web-ocean](https://github.com/Noniv/web-ocean):
+
+> I built this with Claude Code (Opus 5.5). I asked for the most realistic water it could produce, in WebGPU, with a floating camera, and left the architecture and implementation to it. It checked its own work by rendering screenshots in headless Chrome and having separate critic subagents review them, so it was not grading its own output. I gave feedback along the way, mainly on the clouds, which led to replacing the volumetric clouds with the flat layers and later fixing their edge aliasing.
+
+### This fork
+
+The seagulls, stars, Moon, night sky, and eye adaptation were added on top of the original code by [clamey](https://github.com/clamey).
 
 ## Repository layout
 
@@ -129,4 +148,4 @@ I built this with Claude Code (Opus 5.5). I asked for the most realistic water i
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The original work is copyright (c) 2026 Maksymilian Dendura, and that copyright and license notice is kept unchanged in this fork, as the MIT license requires.

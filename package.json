@@ -1,7 +1,7 @@
 {
   "name": "web-ocean",
   "version": "1.0.0",
-  "description": "Real-time WebGPU ocean renderer: FFT waves, whitecaps, physically based sunset sky.",
+  "description": "Real-time WebGPU open-sea scene: FFT waves, physically based sky and clouds, seagulls, real stars and Moon.",
   "license": "MIT",
   "private": true,
   "type": "module",
